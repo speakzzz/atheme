@@ -17,6 +17,7 @@ SRCS   =                    \
     clearchan.c             \
     clones.c                \
     compare.c               \
+    drone.c                 \
     genhash.c               \
     greplog.c               \
     help.c                  \
