@@ -2,12 +2,13 @@
  * SPDX-License-Identifier: ISC
  *
  * modules/operserv/drone.c
- * Persistent Dronescan module for Atheme with /regex/flags support.
- * Features:
- * - Database persistence
- * - Protocol safe kills (AKILLs)
- * - Skips registered users
- * - Tracks Hit Counts for each pattern
+ * Persistent Dronescan module for Atheme.
+ * * COMBINED FEATURES:
+ * - Database Storage
+ * - Regex with Delimiters (/pattern/flags)
+ * - AKILLs (Network Bans)
+ * - Registered User Protection
+ * - Hit Counters
  */
 
 #include <atheme.h>
@@ -17,7 +18,7 @@ struct drone_pattern {
     char *reason;
     struct atheme_regex *regex;
     mowgli_node_t node;
-    unsigned int hits; /* New: Hit Counter */
+    unsigned int hits; /* Hit Counter */
 };
 
 static mowgli_list_t drone_list;
@@ -76,7 +77,7 @@ db_h_drone(struct database_handle *db, const char *type)
     struct atheme_regex *regex;
     unsigned int hits = 0;
 
-    /* Try to read hits if available (backward compatibility) */
+    /* Read hit count if available */
     if (!db_read_uint(db, &hits))
         hits = 0;
 
@@ -111,7 +112,7 @@ write_drone_db(struct database_handle *db)
         db_start_row(db, "DRONE");
         db_write_str(db, dp->pattern);
         db_write_str(db, dp->reason);
-        db_write_uint(db, dp->hits); /* Save the hit count */
+        db_write_uint(db, dp->hits); /* Persist Hit Count */
         db_commit_row(db);
     }
 }
@@ -202,7 +203,6 @@ os_cmd_drone_list(struct sourceinfo *si, int parc, char *parv[])
     MOWGLI_ITER_FOREACH(n, drone_list.head)
     {
         dp = n->data;
-        /* Now displays Hit Count */
         command_success_nodata(si, _("%d: Pattern: \2%s\2 | Hits: \2%u\2 | Reason: %s"), 
             i++, dp->pattern, dp->hits, dp->reason);
     }
@@ -238,7 +238,7 @@ hook_user_add(struct hook_user_nick *data)
         dp = n->data;
         if (regex_match(dp->regex, usermask))
         {
-            /* Increment Hits */
+            /* Count it */
             dp->hits++;
 
             slog(LG_INFO, "DRONE: Matched user %s against pattern %s", usermask, dp->pattern);
