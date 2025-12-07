@@ -5,8 +5,9 @@
  * Persistent Dronescan module for Atheme with /regex/flags support.
  * Features:
  * - Database persistence
- * - AKILLs (Network Bans) instead of simple kills
+ * - Protocol safe kills (AKILLs)
  * - Skips registered users
+ * - Tracks Hit Counts for each pattern
  */
 
 #include <atheme.h>
@@ -16,6 +17,7 @@ struct drone_pattern {
     char *reason;
     struct atheme_regex *regex;
     mowgli_node_t node;
+    unsigned int hits; /* New: Hit Counter */
 };
 
 static mowgli_list_t drone_list;
@@ -46,15 +48,11 @@ drone_compile_regex(const char *pattern_str)
     int flags = 0;
     struct atheme_regex *regex;
 
-    /* Atheme's regex_extract modifies the string, so we need a copy */
     parse_buf = sstrdup(pattern_str);
-
-    /* extract will return NULL if it doesn't look like /regex/ */
     extracted = regex_extract(parse_buf, &p, &flags);
 
     if (extracted == NULL)
     {
-        /* Fallback: Try to compile as a plain regex if no delimiters found */
         sfree(parse_buf);
         return regex_create((char *)pattern_str, 0);
     }
@@ -76,6 +74,11 @@ db_h_drone(struct database_handle *db, const char *type)
     const char *reason = db_read_str(db);
     struct drone_pattern *dp;
     struct atheme_regex *regex;
+    unsigned int hits = 0;
+
+    /* Try to read hits if available (backward compatibility) */
+    if (!db_read_uint(db, &hits))
+        hits = 0;
 
     if (!pattern_const || !reason)
         return;
@@ -91,6 +94,7 @@ db_h_drone(struct database_handle *db, const char *type)
     dp->pattern = sstrdup(pattern_const);
     dp->reason = sstrdup(reason);
     dp->regex = regex;
+    dp->hits = hits;
 
     mowgli_node_add(dp, &dp->node, &drone_list);
 }
@@ -107,6 +111,7 @@ write_drone_db(struct database_handle *db)
         db_start_row(db, "DRONE");
         db_write_str(db, dp->pattern);
         db_write_str(db, dp->reason);
+        db_write_uint(db, dp->hits); /* Save the hit count */
         db_commit_row(db);
     }
 }
@@ -136,7 +141,6 @@ os_cmd_drone_add(struct sourceinfo *si, int parc, char *parv[])
         return;
     }
 
-    /* Try to compile */
     regex = drone_compile_regex(pattern_arg);
     
     if (!regex)
@@ -149,6 +153,7 @@ os_cmd_drone_add(struct sourceinfo *si, int parc, char *parv[])
     dp->pattern = sstrdup(pattern_arg);
     dp->reason = sstrdup(reason);
     dp->regex = regex;
+    dp->hits = 0;
 
     mowgli_node_add(dp, &dp->node, &drone_list);
 
@@ -197,7 +202,9 @@ os_cmd_drone_list(struct sourceinfo *si, int parc, char *parv[])
     MOWGLI_ITER_FOREACH(n, drone_list.head)
     {
         dp = n->data;
-        command_success_nodata(si, _("%d: Pattern: \2%s\2 | Reason: %s"), i++, dp->pattern, dp->reason);
+        /* Now displays Hit Count */
+        command_success_nodata(si, _("%d: Pattern: \2%s\2 | Hits: \2%u\2 | Reason: %s"), 
+            i++, dp->pattern, dp->hits, dp->reason);
     }
     
     command_success_nodata(si, _("End of list."));
@@ -231,27 +238,19 @@ hook_user_add(struct hook_user_nick *data)
         dp = n->data;
         if (regex_match(dp->regex, usermask))
         {
+            /* Increment Hits */
+            dp->hits++;
+
             slog(LG_INFO, "DRONE: Matched user %s against pattern %s", usermask, dp->pattern);
             
             operserv = service_find("operserv");
             
             if (operserv)
             {
-                /* Notify the user */
                 notice(operserv->me->nick, u->nick, "You have been detected as a drone/bad client.");
                 notice(operserv->me->nick, u->nick, "Reason: %s", dp->reason);
 
-                /* * Send an AKILL (Network Ban) via Protocol Interface.
-                 * kline_sts arguments:
-                 * - "*"        : Apply to all servers
-                 * - u->user    : Username to ban
-                 * - u->host    : Hostname/IP to ban
-                 * - 3600       : Duration in seconds (1 Hour)
-                 * - dp->reason : The ban reason
-                 *
-                 * Note: Most IRCds (including Solanum) will automatically disconnect 
-                 * the user when a K-Line is added, so an explicit KILL is not needed.
-                 */
+                /* Send AKILL (1 hour ban) */
                 kline_sts("*", u->user, u->host, 3600, dp->reason);
 
                 wallops("DRONE: matched \2%s\2 against \2%s\2 -- banning (1h)", usermask, dp->pattern);
