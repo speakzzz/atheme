@@ -19,6 +19,7 @@ SRCS   =                    \
     compare.c               \
     drone.c                 \
     genhash.c               \
+    geoip.c                 \
     greplog.c               \
     help.c                  \
     identify.c              \
@@ -70,4 +71,4 @@ include ../../buildsys.module.mk
 
 CPPFLAGS += -I../../include
 LDFLAGS  += -L../../libathemecore
-LIBS     += -lathemecore
+LIBS     += -lathemecore -lmaxminddb
