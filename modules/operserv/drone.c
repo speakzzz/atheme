@@ -3,7 +3,10 @@
  *
  * modules/operserv/drone.c
  * Persistent Dronescan module for Atheme with /regex/flags support.
- * Fixes assertion failures by using safe protocol kills.
+ * Features:
+ * - Database persistence
+ * - Protocol safe kills (no assertion crashes)
+ * - Skips registered users (u->myuser check)
  */
 
 #include <atheme.h>
@@ -217,6 +220,10 @@ hook_user_add(struct hook_user_nick *data)
     if (!u || is_internal_client(u))
         return;
 
+    /* PROTECTION: Ignore users who are already identified to Services */
+    if (u->myuser)
+        return;
+
     /* Build: nick!user@host realname */
     snprintf(usermask, sizeof(usermask), "%s!%s@%s %s", u->nick, u->user, u->host, u->gecos);
 
@@ -231,18 +238,16 @@ hook_user_add(struct hook_user_nick *data)
             
             if (operserv)
             {
-                /* 1. Notify the user (optional, good for transparency) */
+                /* Notify the user */
                 notice(operserv->me->nick, u->nick, "You have been detected as a drone/bad client.");
                 notice(operserv->me->nick, u->nick, "Reason: %s", dp->reason);
 
-                /* 2. Send the KILL via Protocol Interface 
-                 * We use kill_id_sts (raw protocol kill) instead of kill_user()
-                 * to avoid destroying the Atheme user object mid-hook.
-                 * CLIENT_NAME(u) resolves to UID (if TS6) or Nick (if not).
-                 */
+                /* Send the KILL via Protocol Interface */
                 kill_id_sts(operserv->me, CLIENT_NAME(u), dp->reason);
 
-                /* 3. Log it for Admins */
+                /* Optional: Add an AKILL here if desired */
+                /* kline_sts("*", u->user, u->host, 3600, dp->reason); */
+
                 wallops("DRONE: matched \2%s\2 against \2%s\2 -- killing", usermask, dp->pattern);
             }
             
