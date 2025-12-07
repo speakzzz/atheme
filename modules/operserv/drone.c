@@ -5,8 +5,8 @@
  * Persistent Dronescan module for Atheme with /regex/flags support.
  * Features:
  * - Database persistence
- * - Protocol safe kills (no assertion crashes)
- * - Skips registered users (u->myuser check)
+ * - AKILLs (Network Bans) instead of simple kills
+ * - Skips registered users
  */
 
 #include <atheme.h>
@@ -55,7 +55,6 @@ drone_compile_regex(const char *pattern_str)
     if (extracted == NULL)
     {
         /* Fallback: Try to compile as a plain regex if no delimiters found */
-        /* Note: This implies case-sensitive matching by default */
         sfree(parse_buf);
         return regex_create((char *)pattern_str, 0);
     }
@@ -242,13 +241,20 @@ hook_user_add(struct hook_user_nick *data)
                 notice(operserv->me->nick, u->nick, "You have been detected as a drone/bad client.");
                 notice(operserv->me->nick, u->nick, "Reason: %s", dp->reason);
 
-                /* Send the KILL via Protocol Interface */
-                kill_id_sts(operserv->me, CLIENT_NAME(u), dp->reason);
+                /* * Send an AKILL (Network Ban) via Protocol Interface.
+                 * kline_sts arguments:
+                 * - "*"        : Apply to all servers
+                 * - u->user    : Username to ban
+                 * - u->host    : Hostname/IP to ban
+                 * - 3600       : Duration in seconds (1 Hour)
+                 * - dp->reason : The ban reason
+                 *
+                 * Note: Most IRCds (including Solanum) will automatically disconnect 
+                 * the user when a K-Line is added, so an explicit KILL is not needed.
+                 */
+                kline_sts("*", u->user, u->host, 3600, dp->reason);
 
-                /* Optional: Add an AKILL here if desired */
-                /* kline_sts("*", u->user, u->host, 3600, dp->reason); */
-
-                wallops("DRONE: matched \2%s\2 against \2%s\2 -- killing", usermask, dp->pattern);
+                wallops("DRONE: matched \2%s\2 against \2%s\2 -- banning (1h)", usermask, dp->pattern);
             }
             
             return;
