@@ -1,0 +1,10 @@
+Syntax: DRONE ADD <pattern> [reason]
+        DRONE DEL <pattern>
+        DRONE LIST
+
+Manages the persistent drone scanner. This allows you to add regex
+patterns to detect and ban botnets (drones) automatically.
+
+Examples:
+    /msg OperServ DRONE ADD ^MyBot\d+$ Detected Botnet
+    /msg OperServ DRONE LIST
