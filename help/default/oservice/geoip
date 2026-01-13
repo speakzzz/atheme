@@ -1,0 +1,12 @@
+Syntax: GEOIP ADD BADCOUNTRY <CC> <Reason>
+        GEOIP ADD BADASN <ASN> <Reason>
+        GEOIP DEL BADCOUNTRY <CC>
+        GEOIP DEL BADASN <ASN>
+        GEOIP LIST
+
+Allows operators to block connections from specific countries (using
+2-letter ISO codes) or Autonomous Systems (ASNs).
+
+Examples:
+    /msg OperServ GEOIP ADD BADCOUNTRY RU Spam is not allowed
+    /msg OperServ GEOIP ADD BADASN 12345 Malicious ISP
