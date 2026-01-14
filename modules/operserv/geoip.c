@@ -27,7 +27,6 @@
  #ifdef MU_SRA
   #define is_sra(u) ((u) && ((u)->flags & MU_SRA))
  #else
-  /* If MU_SRA is missing, fallback to generic Admin check */
   #define is_sra(u) (has_priv(si, PRIV_USER_ADMIN))
  #endif
 #endif
@@ -75,109 +74,18 @@ struct geoip_exempt {
 };
 
 /* --------------------------------------------------------------------- */
-/* Persistence Functions (Flatfile) */
-/* --------------------------------------------------------------------- */
-
-/* Forward declarations */
-static void add_badcountry_entry(const char *iso, const char *reason);
-static void add_badasn_entry(unsigned int asn, const char *reason);
-static void add_exempt(const char *mask, const char *reason, const char *setter, time_t t);
-
-static void
-save_geoip_db(void)
-{
-    FILE *f = fopen(GEOIP_DB_FILE, "w");
-    mowgli_node_t *n;
-
-    if (!f)
-    {
-        slog(LG_ERROR, "GEOIP: Could not open %s for writing: %s", GEOIP_DB_FILE, strerror(errno));
-        return;
-    }
-
-    /* Save Countries: C <ISO> <Reason> */
-    MOWGLI_ITER_FOREACH(n, badcountry_list.head)
-    {
-        struct badcountry *bc = n->data;
-        fprintf(f, "C %s %s\n", bc->iso_code, bc->reason);
-    }
-
-    /* Save ASNs: A <ASN> <Reason> */
-    MOWGLI_ITER_FOREACH(n, badasn_list.head)
-    {
-        struct badasn *ba = n->data;
-        fprintf(f, "A %u %s\n", ba->asn, ba->reason);
-    }
-
-    /* Save Exemptions: E <Mask> <Time> <Setter> <Reason> */
-    MOWGLI_ITER_FOREACH(n, geoip_exempt_list.head)
-    {
-        struct geoip_exempt *e = n->data;
-        fprintf(f, "E %s %ld %s %s\n", e->mask, (long)e->set_time, e->setter, e->reason);
-    }
-
-    fclose(f);
-}
-
-static void
-load_geoip_db(void)
-{
-    FILE *f = fopen(GEOIP_DB_FILE, "r");
-    char line[BUFSIZE];
-    char *type, *p1, *p2, *p3, *p4;
-
-    if (!f) return; /* No DB yet, that's fine */
-
-    while (fgets(line, sizeof(line), f))
-    {
-        /* Strip newline */
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = 0;
-
-        type = strtok(line, " ");
-        if (!type) continue;
-
-        if (!strcasecmp(type, "C"))
-        {
-            p1 = strtok(NULL, " "); /* ISO */
-            p2 = strtok(NULL, "");  /* Reason (Rest of line) */
-            if (p1 && p2) add_badcountry_entry(p1, p2);
-        }
-        else if (!strcasecmp(type, "A"))
-        {
-            p1 = strtok(NULL, " "); /* ASN */
-            p2 = strtok(NULL, "");  /* Reason */
-            if (p1 && p2) add_badasn_entry(atoi(p1), p2);
-        }
-        else if (!strcasecmp(type, "E"))
-        {
-            p1 = strtok(NULL, " "); /* Mask */
-            p2 = strtok(NULL, " "); /* Time */
-            p3 = strtok(NULL, " "); /* Setter */
-            p4 = strtok(NULL, "");  /* Reason */
-            if (p1 && p2 && p3 && p4) add_exempt(p1, p4, p3, (time_t)atol(p2));
-        }
-    }
-    fclose(f);
-    slog(LG_INFO, "GEOIP: Database loaded from %s", GEOIP_DB_FILE);
-}
-
-/* --------------------------------------------------------------------- */
-/* Helper Functions */
+/* Helper Functions (Defined early to avoid implicit declaration) */
 /* --------------------------------------------------------------------- */
 
 static bool
 is_exempt(const char *ip)
 {
     mowgli_node_t *n;
-
     if (!ip) return false;
-
     MOWGLI_ITER_FOREACH(n, geoip_exempt_list.head)
     {
         struct geoip_exempt *e = n->data;
-        if (!match(e->mask, ip))
-            return true;
+        if (!match(e->mask, ip)) return true;
     }
     return false;
 }
@@ -219,8 +127,7 @@ find_badcountry(const char *iso)
     MOWGLI_ITER_FOREACH(n, badcountry_list.head)
     {
         struct badcountry *bc = n->data;
-        if (!strcasecmp(bc->iso_code, iso))
-            return bc;
+        if (!strcasecmp(bc->iso_code, iso)) return bc;
     }
     return NULL;
 }
@@ -232,10 +139,88 @@ find_badasn(unsigned int asn)
     MOWGLI_ITER_FOREACH(n, badasn_list.head)
     {
         struct badasn *ba = n->data;
-        if (ba->asn == asn)
-            return ba;
+        if (ba->asn == asn) return ba;
     }
     return NULL;
+}
+
+/* --------------------------------------------------------------------- */
+/* Persistence Functions (Flatfile) */
+/* --------------------------------------------------------------------- */
+
+static void
+save_geoip_db(void)
+{
+    FILE *f = fopen(GEOIP_DB_FILE, "w");
+    mowgli_node_t *n;
+
+    if (!f)
+    {
+        slog(LG_ERROR, "GEOIP: Could not open %s for writing: %s", GEOIP_DB_FILE, strerror(errno));
+        return;
+    }
+
+    MOWGLI_ITER_FOREACH(n, badcountry_list.head)
+    {
+        struct badcountry *bc = n->data;
+        fprintf(f, "C %s %s\n", bc->iso_code, bc->reason);
+    }
+
+    MOWGLI_ITER_FOREACH(n, badasn_list.head)
+    {
+        struct badasn *ba = n->data;
+        fprintf(f, "A %u %s\n", ba->asn, ba->reason);
+    }
+
+    MOWGLI_ITER_FOREACH(n, geoip_exempt_list.head)
+    {
+        struct geoip_exempt *e = n->data;
+        fprintf(f, "E %s %ld %s %s\n", e->mask, (long)e->set_time, e->setter, e->reason);
+    }
+
+    fclose(f);
+}
+
+static void
+load_geoip_db(void)
+{
+    FILE *f = fopen(GEOIP_DB_FILE, "r");
+    char line[BUFSIZE];
+    char *type, *p1, *p2, *p3, *p4;
+
+    if (!f) return;
+
+    while (fgets(line, sizeof(line), f))
+    {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+
+        type = strtok(line, " ");
+        if (!type) continue;
+
+        if (!strcasecmp(type, "C"))
+        {
+            p1 = strtok(NULL, " ");
+            p2 = strtok(NULL, "");
+            if (p1 && p2) add_badcountry_entry(p1, p2);
+        }
+        else if (!strcasecmp(type, "A"))
+        {
+            p1 = strtok(NULL, " ");
+            p2 = strtok(NULL, "");
+            if (p1 && p2) add_badasn_entry(atoi(p1), p2);
+        }
+        else if (!strcasecmp(type, "E"))
+        {
+            p1 = strtok(NULL, " ");
+            p2 = strtok(NULL, " ");
+            p3 = strtok(NULL, " ");
+            p4 = strtok(NULL, "");
+            if (p1 && p2 && p3 && p4) add_exempt(p1, p4, p3, (time_t)atol(p2));
+        }
+    }
+    fclose(f);
+    slog(LG_INFO, "GEOIP: Database loaded from %s", GEOIP_DB_FILE);
 }
 
 /* --------------------------------------------------------------------- */
@@ -267,50 +252,9 @@ geoip_config_handler(mowgli_config_file_entry_t *ce)
 }
 
 /* --------------------------------------------------------------------- */
-/* Database Persistence (Atheme DB Backend Hooks - Legacy support) */
-/* --------------------------------------------------------------------- */
-
-static void
-write_geoip_db(struct database_handle *db)
-{
-    /* We use flatfile now, but we keep this empty hook to satisfy Atheme's engine if needed */
-}
-
-static void
-db_h_geoip_exempt(struct database_handle *db, const char *type)
-{
-    /* Handled by flatfile load */
-    const char *mask = db_read_word(db);
-    const char *reason = db_read_word(db);
-    const char *setter = db_read_word(db);
-    time_t t;
-    if (!db_read_time(db, &t)) t = 0;
-    (void)mask; (void)reason; (void)setter; /* Suppress unused warning */
-}
-
-static void
-db_h_geoip_country(struct database_handle *db, const char *type)
-{
-    const char *iso = db_read_word(db);
-    const char *reason = db_read_word(db);
-    (void)iso; (void)reason;
-}
-
-static void
-db_h_geoip_asn(struct database_handle *db, const char *type)
-{
-    unsigned int asn = 0;
-    const char *reason;
-    if (!db_read_uint(db, &asn)) return;
-    reason = db_read_word(db);
-    (void)reason;
-}
-
-/* --------------------------------------------------------------------- */
 /* Core Check Logic */
 /* --------------------------------------------------------------------- */
 
-/* Returns a reason string if banned, NULL if allowed */
 static const char *
 get_geoip_ban_reason(struct user *u)
 {
@@ -319,22 +263,11 @@ get_geoip_ban_reason(struct user *u)
     MMDB_entry_data_s entry_data;
     static char reason[BUFSIZE];
 
-    if (!u) return NULL;
-    
-    if (is_internal_client(u)) return NULL;
+    if (!u || is_internal_client(u) || !u->ip) return NULL;
 
-    if (!u->ip) return NULL;
+    if (is_exempt(u->ip)) return NULL;
 
-    /* Debug disabled to reduce spam */
-    /* slog(LG_DEBUG, "GEOIP: Checking user %s IP %s", u->nick, u->ip); */
-
-    /* 1. Check Whitelist First */
-    if (is_exempt(u->ip))
-    {
-        return NULL;
-    }
-
-    /* 2. Check Country */
+    /* Check Country */
     if (country_db_loaded)
     {
         result = MMDB_lookup_string(&country_mmdb, u->ip, &gai_error, &mmdb_error);
@@ -359,7 +292,7 @@ get_geoip_ban_reason(struct user *u)
         }
     }
 
-    /* 3. Check ASN */
+    /* Check ASN */
     if (asn_db_loaded)
     {
         result = MMDB_lookup_string(&asn_mmdb, u->ip, &gai_error, &mmdb_error);
@@ -390,27 +323,26 @@ enforce_geoip(struct user *u, const char *reason)
     struct service *oserv = service_find("operserv");
     if (!oserv || !u || !reason) return;
 
-    /* Keep INFO level log for Bans so admins know action was taken */
     slog(LG_INFO, "GEOIP: Klining user %s (%s) -> %s", u->nick, u->ip, reason);
     
-    /* Add K-Line for 1 day (86400 seconds) */
+    /* * We ONLY place the K-Line. 
+     * We do NOT call kill_user().
+     * The IRCd will see the new K-Line, check the user against it, and perform the kill itself.
+     * This avoids race conditions in Atheme and eliminates the assertion warning.
+     */
     kline_add("*", u->ip, reason, 86400, oserv->nick);
-    
-    /* Kill to enforce immediately */
-    kill_user(oserv->me, u, "%s", reason);
 }
 
 static void
 check_user_hook(void *data)
 {
-    /* In Atheme, the 'user_add' hook passes a struct hook_user_nick* as data. */
     struct user **u_ptr = (struct user **)data;
     struct user *u;
 
     if (!u_ptr) return;
     u = *u_ptr;
 
-    if (!u) return;
+    if (!u || is_internal_client(u)) return;
 
     const char *reason = get_geoip_ban_reason(u);
     if (reason)
@@ -432,7 +364,6 @@ cmd_geoip_scan(struct sourceinfo *si, int parc, char *parv[])
     mowgli_node_t *n, *tn;
     int scanned = 0;
     
-    /* SRA CHECK */
     if (!is_sra(si->smu)) {
         command_fail(si, fault_noprivs, STR_NOT_AUTHORIZED);
         return;
@@ -480,7 +411,6 @@ cmd_geoip_exempt(struct sourceinfo *si, int parc, char *parv[])
     char *reason = parv[2];
     mowgli_node_t *n, *tn;
 
-    /* SRA CHECK */
     if (!is_sra(si->smu)) {
         command_fail(si, fault_noprivs, STR_NOT_AUTHORIZED);
         return;
@@ -570,7 +500,6 @@ cmd_geoip_add(struct sourceinfo *si, int parc, char *parv[])
     char *target = parv[1];
     char *reason = parv[2];
 
-    /* SRA CHECK */
     if (!is_sra(si->smu)) {
         command_fail(si, fault_noprivs, STR_NOT_AUTHORIZED);
         return;
@@ -633,7 +562,6 @@ cmd_geoip_del(struct sourceinfo *si, int parc, char *parv[])
     char *type = parv[0];
     char *target = parv[1];
 
-    /* SRA CHECK */
     if (!is_sra(si->smu)) {
         command_fail(si, fault_noprivs, STR_NOT_AUTHORIZED);
         return;
@@ -687,7 +615,6 @@ cmd_geoip_list(struct sourceinfo *si, int parc, char *parv[])
     mowgli_node_t *n;
     unsigned int count = 0;
 
-    /* SRA CHECK */
     if (!is_sra(si->smu)) {
         command_fail(si, fault_noprivs, STR_NOT_AUTHORIZED);
         return;
@@ -816,12 +743,6 @@ mod_init(struct module *const restrict m)
     /* Hook into user add */
     hook_add_hook("user_add", (void (*)(void *))check_user_hook);
 
-    /* Setup Database Persistence (Keep hooks for safety, but rely on flatfile) */
-    hook_add_db_write(write_geoip_db);
-    db_register_type_handler("GEOIP_EXEMPT", db_h_geoip_exempt);
-    db_register_type_handler("GEOIP_COUNTRY", db_h_geoip_country);
-    db_register_type_handler("GEOIP_ASN", db_h_geoip_asn);
-
     /* Load Databases */
     const char *c_path = country_db_path ? country_db_path : "/var/lib/GeoIP/GeoLite2-Country.mmdb";
     const char *a_path = asn_db_path ? asn_db_path : "/var/lib/GeoIP/GeoLite2-ASN.mmdb";
@@ -859,10 +780,6 @@ mod_deinit(const enum module_unload_intent intent)
     struct service *oserv = service_find("operserv");
 
     hook_del_hook("user_add", (void (*)(void *))check_user_hook);
-    hook_del_db_write(write_geoip_db);
-    db_unregister_type_handler("GEOIP_EXEMPT");
-    db_unregister_type_handler("GEOIP_COUNTRY");
-    db_unregister_type_handler("GEOIP_ASN");
 
     /* Delete subcommands from local table */
     command_delete(&cmd_geoip_add_rec, geoip_cmds);
