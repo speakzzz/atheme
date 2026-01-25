@@ -13,6 +13,8 @@
  */
 
 #include "atheme.h"
+#include <sys/types.h>
+#include <regex.h>
 
 #define DRONE_DB_FILE "etc/drone.db"
 
@@ -49,6 +51,7 @@ struct drone_entry {
     char *setter;
     time_t set_time;
     unsigned int hits;
+    regex_t *regex; /* Standard POSIX Regex Object */
     mowgli_node_t node;
 };
 
@@ -65,6 +68,33 @@ add_drone(const char *mask, const char *reason, const char *setter, time_t t, un
     d->setter = sstrdup(setter);
     d->set_time = t;
     d->hits = hits;
+    d->regex = NULL;
+
+    /* Detect Regex: Must start with / */
+    if (mask[0] == '/')
+    {
+        /* Remove the leading '/' for compilation if desired, or keep it. 
+           Standard POSIX regex doesn't use delimiters like Perl. 
+           We will strip the first char for compilation. */
+        
+        char *pattern = sstrdup(mask + 1);
+        /* If last char is /, remove it */
+        size_t len = strlen(pattern);
+        if (len > 0 && pattern[len - 1] == '/') {
+            pattern[len - 1] = '\0';
+        }
+
+        d->regex = mowgli_alloc(sizeof(regex_t));
+        /* Compile Extended Regex, Case Insensitive */
+        if (regcomp(d->regex, pattern, REG_EXTENDED | REG_ICASE | REG_NOSUB) != 0)
+        {
+            slog(LG_INFO, "DRONE: Failed to compile regex for mask: %s", mask);
+            free(d->regex);
+            d->regex = NULL;
+        }
+        free(pattern);
+    }
+
     mowgli_node_add(d, &d->node, &drone_list);
 }
 
@@ -81,18 +111,29 @@ find_drone(const char *mask)
     return NULL;
 }
 
-/* Returns the drone entry if the IP matches a drone mask */
+/* Matching Logic: Handles both Regex and Glob */
 static struct drone_entry *
-match_drone(const char *ip)
+match_drone(const char *user_string)
 {
     mowgli_node_t *n;
-    if (!ip) return NULL;
+    if (!user_string) return NULL;
 
     MOWGLI_ITER_FOREACH(n, drone_list.head)
     {
         struct drone_entry *d = n->data;
-        if (!match(d->mask, ip)) /* match() returns 0 on success */
-            return d;
+
+        if (d->regex)
+        {
+            /* POSIX Regex Match */
+            if (regexec(d->regex, user_string, 0, NULL, 0) == 0)
+                return d;
+        }
+        else
+        {
+            /* Standard Wildcard Match */
+            if (!match(d->mask, user_string))
+                return d;
+        }
     }
     return NULL;
 }
@@ -174,11 +215,11 @@ enforce_drone(struct user *u, struct drone_entry *d)
 
     /* Clean reason format */
     char reason[BUFSIZE];
-    snprintf(reason, sizeof(reason), "Blacklisted IP (%s): %s", d->mask, d->reason);
+    snprintf(reason, sizeof(reason), "Blacklisted (%s): %s", d->mask, d->reason);
 
     slog(LG_INFO, "DRONE: Klining user %s (%s) -> Matched blacklist: %s", u->nick, u->ip, d->mask);
     
-    /* Place K-Line */
+    /* Place K-Line only (IRCd handles disconnect) */
     kline_add("*", u->ip, reason, 86400, oserv->nick);
 }
 
@@ -191,15 +232,19 @@ check_user_hook(void *data)
     if (!u_ptr) return;
     u = *u_ptr;
 
-    /* Ignore Internal Clients, Users without IPs, and Registered Users */
+    /* Ignore Internal Clients, Users without IPs */
     if (!u || is_internal_client(u) || !u->ip) return;
     
-    if (u->myuser) /* Registered user protection */
-    {
-        return; 
-    }
+    /* SAFETY: Ignore Registered Users and IRCops */
+    if (u->myuser || is_ircop(u)) return;
 
+    /* Check IP against list */
     struct drone_entry *hit = match_drone(u->ip);
+    
+    /* If no hit on IP, check Hostname */
+    if (!hit && u->host)
+        hit = match_drone(u->host);
+
     if (hit)
     {
         enforce_drone(u, hit);
@@ -224,7 +269,7 @@ cmd_drone_add(struct sourceinfo *si, int parc, char *parv[])
     if (!target || !reason)
     {
         command_fail(si, fault_needmoreparams, STR_INSUFFICIENT_PARAMS, "DRONE ADD");
-        command_fail(si, fault_needmoreparams, _("Usage: DRONE ADD <IP/Mask> <Reason>"));
+        command_fail(si, fault_needmoreparams, _("Usage: DRONE ADD <IP/Mask/Regex> <Reason>"));
         return;
     }
 
@@ -237,7 +282,7 @@ cmd_drone_add(struct sourceinfo *si, int parc, char *parv[])
     add_drone(target, reason, get_storage_oper_name(si), CURRTIME, 0);
     save_drone_db();
     
-    command_success_nodata(si, "Added \2%s\2 to the Drone blacklist. Perform a \2DRONE SCAN\2 to apply immediately.", target);
+    command_success_nodata(si, "Added \2%s\2 to the Drone blacklist.", target);
     logcommand(si, CMDLOG_ADMIN, "DRONE:ADD: \2%s\2 (Reason: %s)", target, reason);
 }
 
@@ -264,6 +309,10 @@ cmd_drone_del(struct sourceinfo *si, int parc, char *parv[])
         if (!strcasecmp(d->mask, target))
         {
             mowgli_node_delete(n, &drone_list);
+            if (d->regex) {
+                regfree(d->regex);
+                mowgli_free(d->regex);
+            }
             free(d->mask);
             free(d->reason);
             free(d->setter);
@@ -325,7 +374,7 @@ cmd_drone_scan(struct sourceinfo *si, int parc, char *parv[])
         if (is_internal_client(u) || !u->ip || u->myuser) continue;
         scanned++;
 
-        if (match_drone(u->ip))
+        if (match_drone(u->ip) || (u->host && match_drone(u->host)))
         {
             mowgli_node_add(u, mowgli_node_create(), &victim_list);
         }
@@ -335,10 +384,11 @@ cmd_drone_scan(struct sourceinfo *si, int parc, char *parv[])
     MOWGLI_ITER_FOREACH_SAFE(n, tn, victim_list.head)
     {
         u = (struct user *)n->data;
-        /* Re-verify user and match to be safe */
         if (user_find(u->nick))
         {
             struct drone_entry *hit = match_drone(u->ip);
+            if (!hit && u->host) hit = match_drone(u->host);
+
             if (hit)
             {
                 enforce_drone(u, hit);
@@ -466,6 +516,10 @@ mod_deinit(const enum module_unload_intent intent)
     MOWGLI_ITER_FOREACH_SAFE(n, tn, drone_list.head)
     {
         struct drone_entry *d = n->data;
+        if (d->regex) {
+            regfree(d->regex);
+            mowgli_free(d->regex);
+        }
         free(d->mask);
         free(d->reason);
         free(d->setter);
