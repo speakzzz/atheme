@@ -6,6 +6,7 @@
  * * COMBINED FEATURES:
  * - Supports Wildcards (*.vpn.net)
  * - Supports Regex (/^drone-\d+/) using standard POSIX regex
+ * - Delete Regex by ID (e.g., DRONE DEL 1)
  * - Checks: Nick, Ident (User), IP, Host
  * - Persistent Flatfile Database (etc/drone.db)
  * - SRA-Only Access
@@ -18,6 +19,7 @@
 #include "atheme.h"
 #include <sys/types.h>
 #include <regex.h>
+#include <ctype.h> /* For isdigit */
 
 #define DRONE_DB_FILE "etc/drone.db"
 
@@ -138,6 +140,19 @@ match_drone(const char *user_string)
     return NULL;
 }
 
+/* Check if string is a number */
+static bool
+is_numeric_string(const char *str)
+{
+    if (!str || !*str) return false;
+    while (*str)
+    {
+        if (!isdigit((unsigned char)*str)) return false;
+        str++;
+    }
+    return true;
+}
+
 /* --------------------------------------------------------------------- */
 /* Persistence Functions (Flatfile) */
 /* --------------------------------------------------------------------- */
@@ -215,7 +230,7 @@ enforce_drone(struct user *u, struct drone_entry *d)
 
     /* Clean reason format */
     char reason[BUFSIZE];
-    snprintf(reason, sizeof(reason), "Blacklisted (%s): %s", d->mask, d->reason);
+    snprintf(reason, sizeof(reason), "Blacklisted: %s", d->reason);
 
     slog(LG_INFO, "DRONE: Klining user %s (%s) -> Matched blacklist: %s", u->nick, u->ip, d->mask);
     
@@ -297,6 +312,9 @@ static void
 cmd_drone_del(struct sourceinfo *si, int parc, char *parv[])
 {
     char *target = parv[0];
+    mowgli_node_t *n, *tn;
+    int index_to_del = -1;
+    int current_idx = 0;
 
     if (!is_sra(si->smu)) {
         command_fail(si, fault_noprivs, STR_NOT_AUTHORIZED);
@@ -309,29 +327,43 @@ cmd_drone_del(struct sourceinfo *si, int parc, char *parv[])
         return;
     }
 
-    mowgli_node_t *n, *tn;
+    /* Check if target is a number (ID deletion) */
+    if (is_numeric_string(target))
+    {
+        index_to_del = atoi(target);
+    }
+
     MOWGLI_ITER_FOREACH_SAFE(n, tn, drone_list.head)
     {
         struct drone_entry *d = n->data;
-        if (!strcasecmp(d->mask, target))
+        current_idx++;
+
+        /* Check for ID match OR String Match */
+        if (current_idx == index_to_del || !strcasecmp(d->mask, target))
         {
             mowgli_node_delete(n, &drone_list);
             if (d->regex) {
                 regfree(d->regex);
                 mowgli_free(d->regex);
             }
+            
+            command_success_nodata(si, "Removed \2%s\2 (ID: %d) from the Drone blacklist.", d->mask, current_idx);
+            logcommand(si, CMDLOG_ADMIN, "DRONE:DEL: \2%s\2 (ID: %d)", d->mask, current_idx);
+
             free(d->mask);
             free(d->reason);
             free(d->setter);
             mowgli_free(d);
             save_drone_db();
             
-            command_success_nodata(si, "Removed \2%s\2 from the Drone blacklist.", target);
-            logcommand(si, CMDLOG_ADMIN, "DRONE:DEL: \2%s\2", target);
             return;
         }
     }
-    command_fail(si, fault_nosuch_target, "Mask \2%s\2 not found in drone list.", target);
+    
+    if (index_to_del > 0)
+        command_fail(si, fault_nosuch_target, "Drone ID \2%d\2 not found.", index_to_del);
+    else
+        command_fail(si, fault_nosuch_target, "Mask \2%s\2 not found in drone list.", target);
 }
 
 static void
