@@ -4,6 +4,9 @@
  * modules/operserv/drone.c
  * Persistent Dronescan module for Atheme.
  * * COMBINED FEATURES:
+ * - Supports Wildcards (*.vpn.net)
+ * - Supports Regex (/^drone-\d+/) using standard POSIX regex
+ * - Checks: Nick, Ident (User), IP, Host
  * - Persistent Flatfile Database (etc/drone.db)
  * - SRA-Only Access
  * - Regex with Delimiters (/pattern/flags)
@@ -73,10 +76,7 @@ add_drone(const char *mask, const char *reason, const char *setter, time_t t, un
     /* Detect Regex: Must start with / */
     if (mask[0] == '/')
     {
-        /* Remove the leading '/' for compilation if desired, or keep it. 
-           Standard POSIX regex doesn't use delimiters like Perl. 
-           We will strip the first char for compilation. */
-        
+        /* Remove the leading '/' for compilation. */
         char *pattern = sstrdup(mask + 1);
         /* If last char is /, remove it */
         size_t len = strlen(pattern);
@@ -232,18 +232,25 @@ check_user_hook(void *data)
     if (!u_ptr) return;
     u = *u_ptr;
 
-    /* Ignore Internal Clients, Users without IPs */
-    if (!u || is_internal_client(u) || !u->ip) return;
+    /* Ignore Internal Clients */
+    if (!u || is_internal_client(u)) return;
     
     /* SAFETY: Ignore Registered Users and IRCops */
     if (u->myuser || is_ircop(u)) return;
 
-    /* Check IP against list */
-    struct drone_entry *hit = match_drone(u->ip);
+    struct drone_entry *hit = NULL;
+
+    /* 1. Check Nickname */
+    if (!hit) hit = match_drone(u->nick);
+
+    /* 2. Check Ident (User) */
+    if (!hit && u->user) hit = match_drone(u->user);
+
+    /* 3. Check IP (if present) */
+    if (!hit && u->ip) hit = match_drone(u->ip);
     
-    /* If no hit on IP, check Hostname */
-    if (!hit && u->host)
-        hit = match_drone(u->host);
+    /* 4. Check Hostname (if present) */
+    if (!hit && u->host) hit = match_drone(u->host);
 
     if (hit)
     {
@@ -371,11 +378,26 @@ cmd_drone_scan(struct sourceinfo *si, int parc, char *parv[])
 
     MOWGLI_PATRICIA_FOREACH(u, &state, userlist)
     {
-        if (is_internal_client(u) || !u->ip || u->myuser) continue;
+        if (is_internal_client(u) || u->myuser) continue;
         scanned++;
 
-        if (match_drone(u->ip) || (u->host && match_drone(u->host)))
-        {
+        /* Check Nick */
+        if (match_drone(u->nick)) {
+            mowgli_node_add(u, mowgli_node_create(), &victim_list);
+            continue;
+        }
+        /* Check Ident */
+        if (match_drone(u->user)) {
+            mowgli_node_add(u, mowgli_node_create(), &victim_list);
+            continue;
+        }
+        /* Check IP */
+        if (u->ip && match_drone(u->ip)) {
+            mowgli_node_add(u, mowgli_node_create(), &victim_list);
+            continue;
+        }
+        /* Check Host */
+        if (u->host && match_drone(u->host)) {
             mowgli_node_add(u, mowgli_node_create(), &victim_list);
         }
     }
@@ -386,7 +408,9 @@ cmd_drone_scan(struct sourceinfo *si, int parc, char *parv[])
         u = (struct user *)n->data;
         if (user_find(u->nick))
         {
-            struct drone_entry *hit = match_drone(u->ip);
+            struct drone_entry *hit = match_drone(u->nick);
+            if (!hit) hit = match_drone(u->user);
+            if (!hit && u->ip) hit = match_drone(u->ip);
             if (!hit && u->host) hit = match_drone(u->host);
 
             if (hit)
