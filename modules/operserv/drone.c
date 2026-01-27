@@ -21,6 +21,7 @@
  * - Pipe-delimited DB (Supports spaces in regex)
  * - Regex Error Reporting (Immediate feedback)
  * - DRONE TEST command
+ * - DRONE SCAN (Dry Run by default, EXEC to ban)
  */
 
 #include "atheme.h"
@@ -68,22 +69,6 @@ struct drone_entry {
 /* Helper Functions */
 /* --------------------------------------------------------------------- */
 
-/* Returns 0 on success, or a REG_ error code */
-static int
-compile_regex_ptr(const char *pattern, regex_t **out_regex)
-{
-    regex_t *r = mowgli_alloc(sizeof(regex_t));
-    /* Strip surrounding slashes if present, though strictly the caller handles the string */
-    int err = regcomp(r, pattern, REG_EXTENDED | REG_ICASE | REG_NOSUB);
-    if (err == 0) {
-        *out_regex = r;
-    } else {
-        mowgli_free(r);
-        *out_regex = NULL;
-    }
-    return err;
-}
-
 static void
 add_drone(const char *mask, const char *reason, const char *setter, time_t t, unsigned int hits)
 {
@@ -104,8 +89,12 @@ add_drone(const char *mask, const char *reason, const char *setter, time_t t, un
             pattern[len - 1] = '\0';
         }
 
+        d->regex = mowgli_alloc(sizeof(regex_t));
         /* We ignore errors here because load_db needs to proceed regardless */
-        compile_regex_ptr(pattern, &d->regex);
+        if (regcomp(d->regex, pattern, REG_EXTENDED | REG_ICASE | REG_NOSUB) != 0) {
+            free(d->regex);
+            d->regex = NULL;
+        }
         free(pattern);
     }
 
@@ -162,7 +151,7 @@ is_numeric_string(const char *str)
 }
 
 /* --------------------------------------------------------------------- */
-/* Persistence (Updated to use PIPE delimiter) */
+/* Persistence (Pipe Delimited) */
 /* --------------------------------------------------------------------- */
 
 static void
@@ -430,14 +419,22 @@ cmd_drone_scan(struct sourceinfo *si, int parc, char *parv[])
         return;
     }
 
+    /* Check for EXEC flag */
+    bool execute = false;
+    if (parc > 0 && parv[0] && !strcasecmp(parv[0], "EXEC")) {
+        execute = true;
+    }
+
     mowgli_patricia_iteration_state_t state;
     struct user *u;
     mowgli_list_t victim_list = { NULL, NULL, 0 };
     mowgli_node_t *n, *tn;
     int scanned = 0;
+    int matches = 0;
 
-    logcommand(si, CMDLOG_ADMIN, "DRONE:SCAN");
-    command_success_nodata(si, "Scanning users against Drone blacklist...");
+    logcommand(si, CMDLOG_ADMIN, "DRONE:SCAN:%s", execute ? "EXEC" : "TEST");
+    command_success_nodata(si, "Scanning users against Drone blacklist (%s Mode)...", 
+        execute ? "\2EXEC - BANNING\2" : "\2DRY RUN - REPORT ONLY\2");
 
     MOWGLI_PATRICIA_FOREACH(u, &state, userlist)
     {
@@ -451,7 +448,6 @@ cmd_drone_scan(struct sourceinfo *si, int parc, char *parv[])
         }
     }
 
-    int banned_count = 0;
     MOWGLI_ITER_FOREACH_SAFE(n, tn, victim_list.head)
     {
         u = (struct user *)n->data;
@@ -463,15 +459,23 @@ cmd_drone_scan(struct sourceinfo *si, int parc, char *parv[])
             if (!hit && u->host) hit = match_drone(u->host);
 
             if (hit) {
-                enforce_drone(u, hit);
-                banned_count++;
+                matches++;
+                if (execute) {
+                    enforce_drone(u, hit);
+                } else {
+                    command_success_nodata(si, "MATCH: \2%s\2 (%s) matches rule \2%s\2", 
+                        u->nick, u->host, hit->mask);
+                }
             }
         }
         mowgli_node_delete(n, &victim_list);
         mowgli_node_free(n);
     }
 
-    command_success_nodata(si, "Scan complete. Scanned: %d. Banned: %d.", scanned, banned_count);
+    if (execute)
+        command_success_nodata(si, "Scan complete. Scanned: %d. Banned: %d.", scanned, matches);
+    else
+        command_success_nodata(si, "Dry Run complete. Scanned: %d. Found %d matches. (Use \2SCAN EXEC\2 to ban)", scanned, matches);
 }
 
 static void
@@ -501,9 +505,10 @@ static struct command cmd_drone_list_rec = {
     .name = "LIST", .desc = "List drone rules.", .access = PRIV_USER_ADMIN,
     .maxparc = 0, .cmd = &cmd_drone_list, .help = { .path = "oservice/drone_list" }
 };
+/* UPDATED: maxparc=1 to support SCAN EXEC */
 static struct command cmd_drone_scan_rec = {
-    .name = "SCAN", .desc = "Scan users.", .access = PRIV_USER_ADMIN,
-    .maxparc = 0, .cmd = &cmd_drone_scan, .help = { .path = "oservice/drone_scan" }
+    .name = "SCAN", .desc = "Scan users (default: Dry Run).", .access = PRIV_USER_ADMIN,
+    .maxparc = 1, .cmd = &cmd_drone_scan, .help = { .path = "oservice/drone_scan" }
 };
 static struct command cmd_drone_test_rec = {
     .name = "TEST", .desc = "Test a string against rules.", .access = PRIV_USER_ADMIN,
@@ -528,7 +533,7 @@ mod_init(struct module *const restrict m)
     command_add(&cmd_drone_del_rec, drone_cmds);
     command_add(&cmd_drone_list_rec, drone_cmds);
     command_add(&cmd_drone_scan_rec, drone_cmds);
-    command_add(&cmd_drone_test_rec, drone_cmds); /* Registered TEST */
+    command_add(&cmd_drone_test_rec, drone_cmds); 
     command_add(&cmd_drone, oserv->commands);
 
     hook_add_hook("user_add", (void (*)(void *))check_user_hook);
@@ -538,7 +543,7 @@ mod_init(struct module *const restrict m)
     save_timer = mowgli_timer_add(base_eventloop, "drone_save_db", 
                                   save_timer_func, NULL, 300);
 
-    slog(LG_INFO, "DRONE: Module loaded (Buffered Save | Pipe DB | Regex Check)");
+    slog(LG_INFO, "DRONE: Module loaded (Buffered Save | Pipe DB | Regex Check | Safe Scan)");
 }
 
 void
