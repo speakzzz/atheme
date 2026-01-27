@@ -25,6 +25,7 @@
  * - CONFIGURABLE DURATIONS (10m, 1h, 7d, perm)
  * - SINGLE-PASS SCANNING (High Performance)
  * - RULE MODIFICATION (Edit active rules)
+ * - LAST HIT TRACKING (Identify stale rules)
  */
 
 #include "atheme.h"
@@ -64,7 +65,8 @@ struct drone_entry {
     char *reason;
     char *setter;
     time_t set_time;
-    long duration; /* Duration in seconds */
+    time_t last_hit; /* New: Timestamp of last match */
+    long duration;
     unsigned int hits;
     regex_t *regex;
     mowgli_node_t node;
@@ -74,7 +76,6 @@ struct drone_entry {
 /* Helper Functions */
 /* --------------------------------------------------------------------- */
 
-/* Parse duration string (e.g. "10m", "1h") to seconds */
 static long
 parse_duration(const char *s)
 {
@@ -84,11 +85,11 @@ parse_duration(const char *s)
     long value = strtol(s, &endptr, 10);
     
     if (value <= 0 && strcasecmp(s, "0") != 0 && strcasecmp(s, "perm") != 0 && strcasecmp(s, "permanent") != 0) 
-        return DEFAULT_DURATION; /* Failed parse or invalid */
+        return DEFAULT_DURATION;
 
     if (*endptr) {
         switch (tolower((unsigned char)*endptr)) {
-            case 's': break; /* Seconds */
+            case 's': break;
             case 'm': value *= 60; break;
             case 'h': value *= 3600; break;
             case 'd': value *= 86400; break;
@@ -100,7 +101,6 @@ parse_duration(const char *s)
     return value;
 }
 
-/* Check a single string against a drone entry */
 static bool
 matches_entry(const struct drone_entry *d, const char *str)
 {
@@ -114,7 +114,7 @@ matches_entry(const struct drone_entry *d, const char *str)
 }
 
 static void
-add_drone(const char *mask, const char *reason, const char *setter, time_t t, long duration, unsigned int hits)
+add_drone(const char *mask, const char *reason, const char *setter, time_t t, long duration, unsigned int hits, time_t last_hit)
 {
     struct drone_entry *d = mowgli_alloc(sizeof(struct drone_entry));
     d->mask = sstrdup(mask);
@@ -123,9 +123,9 @@ add_drone(const char *mask, const char *reason, const char *setter, time_t t, lo
     d->set_time = t;
     d->duration = duration;
     d->hits = hits;
+    d->last_hit = last_hit;
     d->regex = NULL;
 
-    /* Detect Regex: Must start with / */
     if (mask[0] == '/')
     {
         char *pattern = sstrdup(mask + 1);
@@ -169,8 +169,23 @@ is_numeric_string(const char *str)
     return true;
 }
 
+/* Renamed to avoid conflict with Atheme's built-in time_ago */
+static void
+render_time_ago(time_t t, char *buf, size_t len)
+{
+    if (t == 0) {
+        snprintf(buf, len, "Never");
+        return;
+    }
+    time_t diff = CURRTIME - t;
+    if (diff < 60) snprintf(buf, len, "%lds ago", (long)diff);
+    else if (diff < 3600) snprintf(buf, len, "%ldm ago", (long)diff / 60);
+    else if (diff < 86400) snprintf(buf, len, "%ldh ago", (long)diff / 3600);
+    else snprintf(buf, len, "%ldd ago", (long)diff / 86400);
+}
+
 /* --------------------------------------------------------------------- */
-/* Persistence (Pipe Delimited) */
+/* Persistence (Tab Delimited for Safety) */
 /* --------------------------------------------------------------------- */
 
 static void
@@ -184,11 +199,12 @@ save_drone_db(void)
         return;
     }
 
-    /* Format: D <Mask>|<Time>|<Setter>|<Hits>|<Duration>|<Reason> */
+    /* Format: D <mask> \t <time> \t <setter> \t <hits> \t <duration> \t <last_hit> \t <reason> */
     MOWGLI_ITER_FOREACH(n, drone_list.head)
     {
         struct drone_entry *d = n->data;
-        fprintf(f, "D %s|%ld|%s|%u|%ld|%s\n", d->mask, (long)d->set_time, d->setter, d->hits, d->duration, d->reason);
+        fprintf(f, "D %s\t%ld\t%s\t%u\t%ld\t%ld\t%s\n", 
+            d->mask, (long)d->set_time, d->setter, d->hits, d->duration, (long)d->last_hit, d->reason);
     }
 
     fclose(f);
@@ -205,7 +221,7 @@ load_drone_db(void)
 {
     FILE *f = fopen(DRONE_DB_FILE, "r");
     char line[BUFSIZE];
-    char *type, *p1, *p2, *p3, *p4, *p5, *p6;
+    char *type, *p1, *p2, *p3, *p4, *p5, *p6, *p7;
 
     if (!f) return;
 
@@ -214,35 +230,39 @@ load_drone_db(void)
         char *nl = strchr(line, '\n');
         if (nl) *nl = 0;
 
+        /* Auto-detect delimiter: If tab exists, use tab. Else assume Pipe (Legacy Upgrade) */
+        const char *delim = strchr(line, '\t') ? "\t" : "|";
+
         /* First token is space-separated "D " */
         type = strtok(line, " ");
         
         if (type && !strcasecmp(type, "D"))
         {
-            /* Rest is pipe-separated */
-            p1 = strtok(NULL, "|"); /* Mask */
-            p2 = strtok(NULL, "|"); /* Time */
-            p3 = strtok(NULL, "|"); /* Setter */
-            p4 = strtok(NULL, "|"); /* Hits */
-            p5 = strtok(NULL, "|"); /* Duration OR Reason (Old format) */
-            p6 = strtok(NULL, "");  /* Reason (New format) */
+            /* Rest is Tab or Pipe separated */
+            p1 = strtok(NULL, delim); /* Mask */
+            p2 = strtok(NULL, delim); /* Time */
+            p3 = strtok(NULL, delim); /* Setter */
+            p4 = strtok(NULL, delim); /* Hits */
+            p5 = strtok(NULL, delim); /* Duration */
+            p6 = strtok(NULL, delim); /* Last Hit OR Reason (Legacy) */
+            p7 = strtok(NULL, "");    /* Reason (New) OR NULL (Legacy) */
             
             if (p1 && p2 && p3 && p4 && p5) 
             {
-                long dur;
+                long dur = atol(p5);
+                time_t lhit = 0;
                 char *reason_str;
 
-                if (p6) {
-                    /* New Format: p5 is Duration, p6 is Reason */
-                    dur = atol(p5);
-                    reason_str = p6;
+                if (p7) {
+                    /* New Format (7 fields): p6 is LastHit, p7 is Reason */
+                    lhit = (time_t)atol(p6);
+                    reason_str = p7;
                 } else {
-                    /* Old Format: p5 is Reason */
-                    dur = DEFAULT_DURATION;
-                    reason_str = p5;
+                    /* Legacy Format (6 fields): p6 is Reason. LastHit defaults to 0 */
+                    reason_str = p6; 
                 }
 
-                add_drone(p1, reason_str, p3, (time_t)atol(p2), dur, (unsigned int)atoi(p4));
+                add_drone(p1, reason_str, p3, (time_t)atol(p2), dur, (unsigned int)atoi(p4), lhit);
             }
         }
     }
@@ -260,8 +280,9 @@ enforce_drone(struct user *u, struct drone_entry *d)
     struct service *oserv = service_find("operserv");
     if (!oserv || !u || !d) return;
 
-    /* Buffered Hit Counting */
+    /* Update Statistics */
     d->hits++;
+    d->last_hit = CURRTIME;
     
     char reason[BUFSIZE];
     snprintf(reason, sizeof(reason), "Blacklisted: %s", d->reason);
@@ -296,7 +317,7 @@ check_user_hook(void *data)
             (u->host && matches_entry(d, u->host)))
         {
             enforce_drone(u, d);
-            return; /* Stop after first match */
+            return; 
         }
     }
 }
@@ -369,7 +390,7 @@ cmd_drone_add(struct sourceinfo *si, int parc, char *parv[])
         regfree(&reg_check);
     }
 
-    add_drone(target, reason, get_storage_oper_name(si), CURRTIME, duration, 0);
+    add_drone(target, reason, get_storage_oper_name(si), CURRTIME, duration, 0, 0);
     save_drone_db();
     
     char dur_buf[64];
@@ -535,6 +556,7 @@ cmd_drone_list(struct sourceinfo *si, int parc, char *parv[])
     mowgli_node_t *n;
     unsigned int count = 0;
     char buf[BUFSIZE];
+    char ago_buf[64];
     struct tm tm;
 
     command_success_nodata(si, "Drone Blacklist:");
@@ -543,13 +565,14 @@ cmd_drone_list(struct sourceinfo *si, int parc, char *parv[])
         struct drone_entry *d = n->data;
         tm = *localtime(&d->set_time);
         strftime(buf, BUFSIZE, TIME_FORMAT, &tm);
+        render_time_ago(d->last_hit, ago_buf, sizeof(ago_buf));
         
         char dur_str[32];
         if (d->duration == 0) strcpy(dur_str, "Perm");
         else snprintf(dur_str, sizeof(dur_str), "%lds", d->duration);
 
-        command_success_nodata(si, "%d: \2%s\2 (Hits: %u) (Duration: %s) (Set: %s on %s)", 
-            ++count, d->mask, d->hits, dur_str, d->setter, buf);
+        command_success_nodata(si, "%d: \2%s\2 (Hits: %u) (Last: %s) (Dur: %s) (Set: %s on %s)", 
+            ++count, d->mask, d->hits, ago_buf, dur_str, d->setter, buf);
     }
     command_success_nodata(si, "End of list.");
 }
@@ -690,7 +713,7 @@ mod_init(struct module *const restrict m)
 
     drone_cmds = mowgli_patricia_create(strcasecanon);
     command_add(&cmd_drone_add_rec, drone_cmds);
-    command_add(&cmd_drone_mod_rec, drone_cmds); /* Registered MOD */
+    command_add(&cmd_drone_mod_rec, drone_cmds); 
     command_add(&cmd_drone_del_rec, drone_cmds);
     command_add(&cmd_drone_list_rec, drone_cmds);
     command_add(&cmd_drone_scan_rec, drone_cmds);
@@ -704,7 +727,7 @@ mod_init(struct module *const restrict m)
     save_timer = mowgli_timer_add(base_eventloop, "drone_save_db", 
                                   save_timer_func, NULL, 300);
 
-    slog(LG_INFO, "DRONE: Module loaded (Buffered Save | Pipe DB | Regex Check | Safe Scan | Duration | Mod)");
+    slog(LG_INFO, "DRONE: Module loaded (Buffered Save | Tab DB | Regex Check | Safe Scan | Duration | LastHit)");
 }
 
 void
