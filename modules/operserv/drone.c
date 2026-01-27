@@ -3,6 +3,9 @@
  *
  * modules/operserv/drone.c
  * Persistent Dronescan module for Atheme.
+ *
+ * UPDATED: Fixed compilation types for libmowgli-2
+ *
  * * COMBINED FEATURES:
  * - Supports Wildcards (*.vpn.net)
  * - Supports Regex (/^drone-\d+/) using standard POSIX regex
@@ -14,6 +17,7 @@
  * - Instant K-Line (No crash warnings)
  * - Registered User Protection
  * - Hit Counters
+ * - Background Timer Saving (Prevents disk thrashing)
  */
 
 #include "atheme.h"
@@ -48,6 +52,9 @@ static mowgli_patricia_t *drone_cmds = NULL;
 
 /* List of Drones */
 static mowgli_list_t drone_list;
+
+/* Global Timer Handle - FIXED TYPE HERE */
+static mowgli_eventloop_timer_t *save_timer = NULL;
 
 /* Structure */
 struct drone_entry {
@@ -179,6 +186,13 @@ save_drone_db(void)
     fclose(f);
 }
 
+/* Timer callback wrapper for saving */
+static void
+save_timer_func(void *unused)
+{
+    save_drone_db();
+}
+
 static void
 load_drone_db(void)
 {
@@ -224,9 +238,14 @@ enforce_drone(struct user *u, struct drone_entry *d)
     struct service *oserv = service_find("operserv");
     if (!oserv || !u || !d) return;
 
-    /* Increment Hits */
+    /* Increment Hits in Memory Only */
     d->hits++;
-    save_drone_db(); /* Save hits immediately */
+    
+    /* * PERFORMANCE FIX: 
+     * We do NOT call save_drone_db() here. 
+     * Writing to disk on every hit causes lag during floods.
+     * The background timer handles saving.
+     */
 
     /* Clean reason format */
     char reason[BUFSIZE];
@@ -302,7 +321,7 @@ cmd_drone_add(struct sourceinfo *si, int parc, char *parv[])
     }
 
     add_drone(target, reason, get_storage_oper_name(si), CURRTIME, 0);
-    save_drone_db();
+    save_drone_db(); /* Manual add should save immediately */
     
     command_success_nodata(si, "Added \2%s\2 to the Drone blacklist.", target);
     logcommand(si, CMDLOG_ADMIN, "DRONE:ADD: \2%s\2 (Reason: %s)", target, reason);
@@ -354,7 +373,8 @@ cmd_drone_del(struct sourceinfo *si, int parc, char *parv[])
             free(d->reason);
             free(d->setter);
             mowgli_free(d);
-            save_drone_db();
+            
+            save_drone_db(); /* Manual del should save immediately */
             
             return;
         }
@@ -547,13 +567,29 @@ mod_init(struct module *const restrict m)
 
     load_drone_db();
 
-    slog(LG_INFO, "DRONE: Module loaded successfully.");
+    /* * NEW: Add a background timer to save the database every 300 seconds (5 mins).
+     * This buffers the 'hits' updates to prevent disk thrashing.
+     */
+    save_timer = mowgli_timer_add(base_eventloop, "drone_save_db", 
+                                  save_timer_func, NULL, 300);
+
+    slog(LG_INFO, "DRONE: Module loaded successfully with Buffered Save enabled.");
 }
 
 void
 mod_deinit(const enum module_unload_intent intent)
 {
     struct service *oserv = service_find("operserv");
+
+    /* Destroy the timer first */
+    if (save_timer)
+    {
+        mowgli_timer_destroy(base_eventloop, save_timer);
+        save_timer = NULL;
+    }
+
+    /* Save one last time to persist any pending hits */
+    save_drone_db();
 
     hook_del_hook("user_add", (void (*)(void *))check_user_hook);
 
