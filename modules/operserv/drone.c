@@ -24,6 +24,7 @@
  * - DRONE SCAN (Dry Run by default, EXEC to ban)
  * - CONFIGURABLE DURATIONS (10m, 1h, 7d, perm)
  * - SINGLE-PASS SCANNING (High Performance)
+ * - RULE MODIFICATION (Edit active rules)
  */
 
 #include "atheme.h"
@@ -82,7 +83,7 @@ parse_duration(const char *s)
     char *endptr;
     long value = strtol(s, &endptr, 10);
     
-    if (value <= 0 && strcasecmp(s, "0") != 0 && strcasecmp(s, "perm") != 0) 
+    if (value <= 0 && strcasecmp(s, "0") != 0 && strcasecmp(s, "perm") != 0 && strcasecmp(s, "permanent") != 0) 
         return DEFAULT_DURATION; /* Failed parse or invalid */
 
     if (*endptr) {
@@ -284,7 +285,7 @@ check_user_hook(void *data)
 
     mowgli_node_t *n;
     
-    /* SINGLE PASS SCAN: Check all fields in one loop */
+    /* SINGLE PASS SCAN */
     MOWGLI_ITER_FOREACH(n, drone_list.head)
     {
         struct drone_entry *d = n->data;
@@ -295,7 +296,7 @@ check_user_hook(void *data)
             (u->host && matches_entry(d, u->host)))
         {
             enforce_drone(u, d);
-            return; /* Stop after first match to avoid double-klining */
+            return; /* Stop after first match */
         }
     }
 }
@@ -325,23 +326,15 @@ cmd_drone_add(struct sourceinfo *si, int parc, char *parv[])
         return;
     }
 
-    /* Logic to handle optional Duration */
     if (arg3) {
-        /* 3 arguments: Mask, Duration, Reason */
         duration = parse_duration(arg2);
         reason = arg3;
     } else {
-        /* 2 arguments: Mask, Reason (or possibly Duration?) */
-        /* Check if arg2 looks like a duration */
         if (isdigit((unsigned char)arg2[0])) {
-            /* It starts with a digit, is it a duration or a reason like "404 Error"? */
-            /* Let's try to parse it. If parse returns Default but input wasn't default, treat as reason */
             long test_dur = parse_duration(arg2);
             if (test_dur == DEFAULT_DURATION && strcasecmp(arg2, "24h") != 0 && strcasecmp(arg2, "1d") != 0 && strcasecmp(arg2, "86400") != 0) {
-                /* Probably a reason */
                 reason = arg2;
             } else {
-                /* Valid duration, but missing reason? */
                 command_fail(si, fault_needmoreparams, STR_INSUFFICIENT_PARAMS, "DRONE ADD");
                 command_fail(si, fault_needmoreparams, _("If you specify a duration, you must provide a reason."));
                 return;
@@ -356,7 +349,7 @@ cmd_drone_add(struct sourceinfo *si, int parc, char *parv[])
         return;
     }
 
-    /* PRE-VALIDATION: Check Regex Validity */
+    /* PRE-VALIDATION */
     if (target[0] == '/')
     {
         char *pattern = sstrdup(target + 1);
@@ -385,6 +378,71 @@ cmd_drone_add(struct sourceinfo *si, int parc, char *parv[])
 
     command_success_nodata(si, "Added \2%s\2 to the Drone blacklist (%s).", target, dur_buf);
     logcommand(si, CMDLOG_ADMIN, "DRONE:ADD: \2%s\2 (%s) Reason: %s", target, dur_buf, reason);
+}
+
+static void
+cmd_drone_mod(struct sourceinfo *si, int parc, char *parv[])
+{
+    char *target_id = parv[0];
+    char *action = parv[1];
+    char *value = parv[2];
+    mowgli_node_t *n;
+    int index = 0;
+    int id_to_find = -1;
+
+    if (!is_sra(si->smu)) {
+        command_fail(si, fault_noprivs, STR_NOT_AUTHORIZED);
+        return;
+    }
+
+    if (!target_id || !action || !value) {
+        command_fail(si, fault_needmoreparams, STR_INSUFFICIENT_PARAMS, "DRONE MOD");
+        command_fail(si, fault_needmoreparams, _("Usage: DRONE MOD <ID> <DURATION|REASON> <NewValue>"));
+        return;
+    }
+
+    if (is_numeric_string(target_id)) {
+        id_to_find = atoi(target_id);
+    } else {
+        command_fail(si, fault_badparams, "Target must be a numeric ID (check DRONE LIST).");
+        return;
+    }
+
+    MOWGLI_ITER_FOREACH(n, drone_list.head)
+    {
+        struct drone_entry *d = n->data;
+        index++;
+
+        if (index == id_to_find)
+        {
+            if (!strcasecmp(action, "DURATION") || !strcasecmp(action, "TIME")) {
+                long new_dur = parse_duration(value);
+                d->duration = new_dur;
+                
+                char dur_buf[64];
+                if (new_dur == 0) strcpy(dur_buf, "Permanent");
+                else snprintf(dur_buf, sizeof(dur_buf), "%ld sec", new_dur);
+                
+                command_success_nodata(si, "Updated ID \2%d\2 duration to: %s", id_to_find, dur_buf);
+                logcommand(si, CMDLOG_ADMIN, "DRONE:MOD:DURATION: ID %d -> %s", id_to_find, dur_buf);
+            }
+            else if (!strcasecmp(action, "REASON")) {
+                free(d->reason);
+                d->reason = sstrdup(value);
+                command_success_nodata(si, "Updated ID \2%d\2 reason to: %s", id_to_find, d->reason);
+                logcommand(si, CMDLOG_ADMIN, "DRONE:MOD:REASON: ID %d -> %s", id_to_find, d->reason);
+            }
+            else {
+                command_fail(si, fault_badparams, "Unknown action. Use DURATION or REASON.");
+                return;
+            }
+            
+            save_drone_db();
+            return;
+        }
+    }
+
+    command_fail(si, fault_nosuch_target, "Drone ID \2%d\2 not found.", id_to_find);
 }
 
 static void
@@ -536,7 +594,7 @@ cmd_drone_scan(struct sourceinfo *si, int parc, char *parv[])
                 (u->host && matches_entry(d, u->host)))
             {
                 mowgli_node_add(u, mowgli_node_create(), &victim_list);
-                break; /* Only need to match once per user */
+                break; 
             }
         }
     }
@@ -582,7 +640,7 @@ cmd_drone_dispatch(struct sourceinfo *si, int parc, char *parv[])
 {
     if (parc < 1) {
         command_fail(si, fault_needmoreparams, STR_INSUFFICIENT_PARAMS, "DRONE");
-        command_fail(si, fault_needmoreparams, _("Available: ADD, DEL, LIST, SCAN, TEST"));
+        command_fail(si, fault_needmoreparams, _("Available: ADD, MOD, DEL, LIST, SCAN, TEST"));
         return;
     }
     subcommand_dispatch_simple(si->service, si, parc, parv, drone_cmds, "DRONE");
@@ -595,6 +653,10 @@ cmd_drone_dispatch(struct sourceinfo *si, int parc, char *parv[])
 static struct command cmd_drone_add_rec = {
     .name = "ADD", .desc = "Add a drone rule.", .access = PRIV_USER_ADMIN,
     .maxparc = 3, .cmd = &cmd_drone_add, .help = { .path = "oservice/drone_add" }
+};
+static struct command cmd_drone_mod_rec = {
+    .name = "MOD", .desc = "Modify a drone rule.", .access = PRIV_USER_ADMIN,
+    .maxparc = 3, .cmd = &cmd_drone_mod, .help = { .path = "oservice/drone_mod" }
 };
 static struct command cmd_drone_del_rec = {
     .name = "DEL", .desc = "Remove a drone rule.", .access = PRIV_USER_ADMIN,
@@ -628,6 +690,7 @@ mod_init(struct module *const restrict m)
 
     drone_cmds = mowgli_patricia_create(strcasecanon);
     command_add(&cmd_drone_add_rec, drone_cmds);
+    command_add(&cmd_drone_mod_rec, drone_cmds); /* Registered MOD */
     command_add(&cmd_drone_del_rec, drone_cmds);
     command_add(&cmd_drone_list_rec, drone_cmds);
     command_add(&cmd_drone_scan_rec, drone_cmds);
@@ -641,7 +704,7 @@ mod_init(struct module *const restrict m)
     save_timer = mowgli_timer_add(base_eventloop, "drone_save_db", 
                                   save_timer_func, NULL, 300);
 
-    slog(LG_INFO, "DRONE: Module loaded (Buffered Save | Pipe DB | Regex Check | Safe Scan | Duration)");
+    slog(LG_INFO, "DRONE: Module loaded (Buffered Save | Pipe DB | Regex Check | Safe Scan | Duration | Mod)");
 }
 
 void
@@ -658,6 +721,7 @@ mod_deinit(const enum module_unload_intent intent)
     hook_del_hook("user_add", (void (*)(void *))check_user_hook);
     
     command_delete(&cmd_drone_add_rec, drone_cmds);
+    command_delete(&cmd_drone_mod_rec, drone_cmds);
     command_delete(&cmd_drone_del_rec, drone_cmds);
     command_delete(&cmd_drone_list_rec, drone_cmds);
     command_delete(&cmd_drone_scan_rec, drone_cmds);
