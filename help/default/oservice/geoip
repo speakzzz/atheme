@@ -1,12 +1,38 @@
-Syntax: GEOIP ADD BADCOUNTRY <CC> <Reason>
-        GEOIP ADD BADASN <ASN> <Reason>
+Help for GEOIP:
+
+GEOIP blocks connections from chosen countries (2-letter ISO codes,
+e.g. RU) or networks (Autonomous System Numbers, e.g. 7018). Each
+connecting user's IP is looked up in the MaxMind GeoLite2 databases;
+a match places a K-Line on that IP.
+
+Users who are logged in to services, IRC operators and services'
+own clients are never matched. New users are checked about two
+seconds after they connect, so SASL and burst logins are seen.
+IPs or masks on the exemption list are never matched either.
+
+Durations: a number of seconds, or a number followed by one of
+s, m, h, d, w, y (e.g. 10m, 1h, 7d). Use 0 or "perm" for a
+permanent K-Line. Entries without their own duration use the
+network default (24 hours unless changed in the configuration).
+
+Syntax: GEOIP ADD BADCOUNTRY <CC> [duration] <reason>
+        GEOIP ADD BADASN <ASN> [duration] <reason>
         GEOIP DEL BADCOUNTRY <CC>
         GEOIP DEL BADASN <ASN>
         GEOIP LIST
+        GEOIP EXEMPT ADD <ip|mask> <reason>
+        GEOIP EXEMPT DEL <ip|mask>
+        GEOIP EXEMPT LIST
+        GEOIP SCAN [EXEC]
 
-Allows operators to block connections from specific countries (using
-2-letter ISO codes) or Autonomous Systems (ASNs).
+Adding a country or ASN only affects new connections. To check
+users who are already online, run GEOIP SCAN: on its own it only
+reports who would be K-Lined; GEOIP SCAN EXEC K-Lines them.
 
 Examples:
-    /msg OperServ GEOIP ADD BADCOUNTRY RU Spam is not allowed
-    /msg OperServ GEOIP ADD BADASN 12345 Malicious ISP
+    /msg &nick& GEOIP ADD BADCOUNTRY XX 7d Abuse from this country
+    /msg &nick& GEOIP ADD BADASN AS64500 Abusive hosting provider
+    /msg &nick& GEOIP EXEMPT ADD 192.0.2.* Trusted webchat gateway
+    /msg &nick& GEOIP SCAN
+    /msg &nick& GEOIP SCAN EXEC
+    /msg &nick& GEOIP DEL BADCOUNTRY XX

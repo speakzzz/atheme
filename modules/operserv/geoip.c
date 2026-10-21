@@ -3,6 +3,20 @@
  *
  * modules/operserv/geoip.c
  * Services-side GeoIP & ASN Manager.
+ *
+ * Configuration (optional; put it AFTER the loadmodule line):
+ *
+ *   loadmodule "operserv/geoip";
+ *
+ *   geoip {
+ *       country_db = "/var/lib/GeoIP/GeoLite2-Country.mmdb";
+ *       asn_db     = "/var/lib/GeoIP/GeoLite2-ASN.mmdb";
+ *       duration   = 1d;   (default K-Line length; 0 = permanent; default 24h)
+ *   };
+ *
+ * The paths shown are the defaults. REHASH re-reads the block and reopens
+ * the databases. Blocked countries/ASNs can also have their own duration:
+ *   GEOIP ADD BADCOUNTRY XX 7d <reason>
  */
 
 #include "atheme.h"
@@ -41,6 +55,10 @@ static mowgli_list_t geoip_conf_table;
 static char *country_db_path = NULL;
 static char *asn_db_path = NULL;
 
+/* geoip { duration = ...; } -- K-Line length for entries without their own */
+#define GEOIP_BUILTIN_DURATION 86400U /* 24 hours */
+static unsigned int geoip_default_duration = GEOIP_BUILTIN_DURATION;
+
 /* MaxMind DB Handles */
 static MMDB_s country_mmdb;
 static MMDB_s asn_mmdb;
@@ -53,15 +71,20 @@ static mowgli_list_t badasn_list;
 static mowgli_list_t geoip_exempt_list;
 
 /* Structures */
+/* duration: K-Line length in seconds, 0 = permanent, -1 = use geoip { duration } */
+#define GEOIP_DURATION_DEFAULT (-1L)
+
 struct badcountry {
     char *iso_code;
     char *reason;
+    long duration;
     mowgli_node_t node;
 };
 
 struct badasn {
     unsigned int asn;
     char *reason;
+    long duration;
     mowgli_node_t node;
 };
 
@@ -102,20 +125,24 @@ add_exempt(const char *mask, const char *reason, const char *setter, time_t t)
 }
 
 static void
-add_badcountry_entry(const char *iso, const char *reason)
+add_badcountry_entry(const char *iso, const char *reason, long duration)
 {
     struct badcountry *bc = mowgli_alloc(sizeof(struct badcountry));
     bc->iso_code = sstrdup(iso);
+    for (char *c = bc->iso_code; *c; c++)
+        *c = toupper((unsigned char)*c);
     bc->reason = sstrdup(reason);
+    bc->duration = duration;
     mowgli_node_add(bc, &bc->node, &badcountry_list);
 }
 
 static void
-add_badasn_entry(unsigned int asn, const char *reason)
+add_badasn_entry(unsigned int asn, const char *reason, long duration)
 {
     struct badasn *ba = mowgli_alloc(sizeof(struct badasn));
     ba->asn = asn;
     ba->reason = sstrdup(reason);
+    ba->duration = duration;
     mowgli_node_add(ba, &ba->node, &badasn_list);
 }
 
@@ -144,6 +171,131 @@ find_badasn(unsigned int asn)
     return NULL;
 }
 
+/* Exact (case-insensitive) lookup of an exemption mask, for ADD/DEL. */
+static struct geoip_exempt *
+find_exempt_mask(const char *mask)
+{
+    mowgli_node_t *n;
+    MOWGLI_ITER_FOREACH(n, geoip_exempt_list.head)
+    {
+        struct geoip_exempt *e = n->data;
+        if (!strcasecmp(e->mask, mask)) return e;
+    }
+    return NULL;
+}
+
+/*
+ * Strictly parse a duration token, same rules as operserv/drone:
+ * "perm", "permanent" or "0" (permanent, 0), or a positive integer with an
+ * optional single unit suffix s, m, h, d, w, y. Returns false if the token
+ * is not a duration, so callers can tell it apart from the start of a reason.
+ */
+static bool
+parse_duration(const char *s, long *out)
+{
+    char *endptr;
+    long value, mult = 1;
+
+    if (!s || !*s)
+        return false;
+
+    if (!strcasecmp(s, "perm") || !strcasecmp(s, "permanent") || !strcmp(s, "0")) {
+        *out = 0;
+        return true;
+    }
+
+    if (!isdigit((unsigned char)*s))
+        return false;
+
+    errno = 0;
+    value = strtol(s, &endptr, 10);
+    if (errno || value <= 0)
+        return false;
+
+    if (*endptr) {
+        if (endptr[1] != '\0')
+            return false;
+
+        switch (tolower((unsigned char)*endptr)) {
+            case 's': mult = 1; break;
+            case 'm': mult = 60; break;
+            case 'h': mult = 3600; break;
+            case 'd': mult = 86400; break;
+            case 'w': mult = 604800; break;
+            case 'y': mult = 31536000; break;
+            default: return false;
+        }
+    }
+
+    if (value > LONG_MAX / mult)
+        return false;
+
+    *out = value * mult;
+    return true;
+}
+
+/* Effective K-Line duration for an entry. */
+static long
+entry_duration(long duration)
+{
+    return duration == GEOIP_DURATION_DEFAULT ? (long)geoip_default_duration : duration;
+}
+
+/* Human-readable duration for LIST and confirmations. */
+static void
+format_entry_duration(long duration, char *buf, size_t len)
+{
+    long eff = entry_duration(duration);
+    const char *suffix = (duration == GEOIP_DURATION_DEFAULT) ? " (default)" : "";
+
+    if (eff == 0)
+        snprintf(buf, len, "Permanent%s", suffix);
+    else if (eff % 86400 == 0)
+        snprintf(buf, len, "%ldd%s", eff / 86400, suffix);
+    else if (eff % 3600 == 0)
+        snprintf(buf, len, "%ldh%s", eff / 3600, suffix);
+    else if (eff % 60 == 0)
+        snprintf(buf, len, "%ldm%s", eff / 60, suffix);
+    else
+        snprintf(buf, len, "%lds%s", eff, suffix);
+}
+
+/*
+ * Split "<duration> <reason...>" or "<reason...>" (the rest of the line).
+ * On success *reason points into buf. Returns false (with an error already
+ * sent) if a duration was given without a reason.
+ */
+static bool
+split_duration_reason(struct sourceinfo *si, const char *cmdname, const char *rest,
+                      char *buf, size_t buflen, long *duration, const char **reason)
+{
+    mowgli_strlcpy(buf, rest, buflen);
+
+    char *sp = strchr(buf, ' ');
+    if (sp) *sp = '\0';
+
+    long parsed;
+    if (parse_duration(buf, &parsed))
+    {
+        const char *r = sp ? sp + 1 : "";
+        while (*r == ' ') r++;
+        if (!*r)
+        {
+            command_fail(si, fault_needmoreparams, STR_INSUFFICIENT_PARAMS, cmdname);
+            command_fail(si, fault_needmoreparams, _("If you specify a duration, you must provide a reason."));
+            return false;
+        }
+        *duration = parsed;
+        *reason = r;
+        return true;
+    }
+
+    if (sp) *sp = ' ';
+    *duration = GEOIP_DURATION_DEFAULT;
+    *reason = buf;
+    return true;
+}
+
 /* --------------------------------------------------------------------- */
 /* Persistence Functions (Flatfile) */
 /* --------------------------------------------------------------------- */
@@ -168,13 +320,21 @@ save_geoip_db(void)
     MOWGLI_ITER_FOREACH(n, badcountry_list.head)
     {
         struct badcountry *bc = n->data;
-        fprintf(f, "C %s %s\n", bc->iso_code, bc->reason);
+        /* Entries using the default keep the original "C" record format;
+         * entries with their own duration use "CD <iso> <secs> <reason>". */
+        if (bc->duration == GEOIP_DURATION_DEFAULT)
+            fprintf(f, "C %s %s\n", bc->iso_code, bc->reason);
+        else
+            fprintf(f, "CD %s %ld %s\n", bc->iso_code, bc->duration, bc->reason);
     }
 
     MOWGLI_ITER_FOREACH(n, badasn_list.head)
     {
         struct badasn *ba = n->data;
-        fprintf(f, "A %u %s\n", ba->asn, ba->reason);
+        if (ba->duration == GEOIP_DURATION_DEFAULT)
+            fprintf(f, "A %u %s\n", ba->asn, ba->reason);
+        else
+            fprintf(f, "AD %u %ld %s\n", ba->asn, ba->duration, ba->reason);
     }
 
     MOWGLI_ITER_FOREACH(n, geoip_exempt_list.head)
@@ -229,13 +389,27 @@ load_geoip_db(void)
         {
             p1 = strtok(NULL, " ");
             p2 = strtok(NULL, "");
-            if (p1 && p2) add_badcountry_entry(p1, p2);
+            if (p1 && p2) add_badcountry_entry(p1, p2, GEOIP_DURATION_DEFAULT);
+        }
+        else if (!strcasecmp(type, "CD"))
+        {
+            p1 = strtok(NULL, " ");
+            p2 = strtok(NULL, " ");
+            p3 = strtok(NULL, "");
+            if (p1 && p2 && p3) add_badcountry_entry(p1, p3, atol(p2));
         }
         else if (!strcasecmp(type, "A"))
         {
             p1 = strtok(NULL, " ");
             p2 = strtok(NULL, "");
-            if (p1 && p2) add_badasn_entry(atoi(p1), p2);
+            if (p1 && p2) add_badasn_entry(strtoul(p1, NULL, 10), p2, GEOIP_DURATION_DEFAULT);
+        }
+        else if (!strcasecmp(type, "AD"))
+        {
+            p1 = strtok(NULL, " ");
+            p2 = strtok(NULL, " ");
+            p3 = strtok(NULL, "");
+            if (p1 && p2 && p3) add_badasn_entry(strtoul(p1, NULL, 10), p3, atol(p2));
         }
         else if (!strcasecmp(type, "E"))
         {
@@ -334,6 +508,10 @@ geoip_config_purge(void *unused)
     free(asn_db_path);
     country_db_path = NULL;
     asn_db_path = NULL;
+
+    /* Atheme only resets defaults for blocks that are present, so do it here:
+     * removing "duration" (or the whole block) and rehashing restores 24h. */
+    geoip_default_duration = GEOIP_BUILTIN_DURATION;
 }
 
 static void
@@ -346,8 +524,13 @@ geoip_config_ready(void *unused)
 /* Core Check Logic */
 /* --------------------------------------------------------------------- */
 
+/*
+ * Returns the K-Line reason if the user's IP is in a blocked country or ASN
+ * (and not exempted), else NULL. *duration gets the K-Line length to use.
+ * The returned string is a static buffer.
+ */
 static const char *
-get_geoip_ban_reason(struct user *u)
+get_geoip_ban_reason(struct user *u, long *duration)
 {
     int gai_error, mmdb_error;
     MMDB_lookup_result_s result;
@@ -366,7 +549,8 @@ get_geoip_ban_reason(struct user *u)
         {
             if (MMDB_get_value(&result.entry, &entry_data, "country", "iso_code", NULL) == MMDB_SUCCESS)
             {
-                if (entry_data.has_data && entry_data.type == MMDB_DATA_TYPE_UTF8_STRING)
+                if (entry_data.has_data && entry_data.type == MMDB_DATA_TYPE_UTF8_STRING &&
+                    entry_data.data_size == 2)
                 {
                     char iso_code[3];
                     memset(iso_code, 0, sizeof(iso_code));
@@ -376,6 +560,7 @@ get_geoip_ban_reason(struct user *u)
                     if (bc)
                     {
                         snprintf(reason, sizeof(reason), "Country banned (%s): %s", bc->iso_code, bc->reason);
+                        *duration = entry_duration(bc->duration);
                         return reason;
                     }
                 }
@@ -400,6 +585,7 @@ get_geoip_ban_reason(struct user *u)
                     if (ba)
                     {
                         snprintf(reason, sizeof(reason), "ASN banned (%u): %s", asn, ba->reason);
+                        *duration = entry_duration(ba->duration);
                         return reason;
                     }
                 }
@@ -444,7 +630,7 @@ kline_user_if_new(struct user *u, const char *reason, long duration, const char 
 
 /* Returns true if a new K-Line was placed. */
 static bool
-enforce_geoip(struct user *u, const char *reason)
+enforce_geoip(struct user *u, const char *reason, long duration)
 {
     struct service *oserv = service_find("operserv");
     if (!oserv || !u || !reason) return false;
@@ -454,7 +640,7 @@ enforce_geoip(struct user *u, const char *reason)
      * The IRCd will see the new K-Line, check the user against it, and perform the kill itself.
      * This avoids race conditions in Atheme and eliminates the assertion warning.
      */
-    if (kline_user_if_new(u, reason, 86400, oserv->nick))
+    if (kline_user_if_new(u, reason, duration, oserv->nick))
     {
         slog(LG_INFO, "GEOIP: Klining user %s (%s) -> %s", u->nick, u->ip, reason);
         return true;
@@ -514,9 +700,10 @@ pending_check_func(void *unused)
 
         if (u && u->ts == p->ts && !geoip_user_exempt(u))
         {
-            const char *reason = get_geoip_ban_reason(u);
+            long duration;
+            const char *reason = get_geoip_ban_reason(u, &duration);
             if (reason)
-                enforce_geoip(u, reason);
+                (void) enforce_geoip(u, reason, duration);
         }
 
         geoip_pending_free(p);
@@ -558,14 +745,28 @@ cmd_geoip_scan(struct sourceinfo *si, int parc, char *parv[])
     mowgli_list_t victim_list = { NULL, NULL, 0 };
     mowgli_node_t *n, *tn;
     int scanned = 0;
-    
+
     if (!is_sra(si->smu)) {
         command_fail(si, fault_noprivs, STR_NOT_AUTHORIZED);
         return;
     }
 
-    logcommand(si, CMDLOG_ADMIN, "GEOIP:SCAN");
-    command_success_nodata(si, "Scanning all users against GeoIP database...");
+    /* Dry run by default, like DRONE SCAN; EXEC actually places K-Lines. */
+    bool execute = false;
+    if (parc > 0 && parv[0])
+    {
+        if (strcasecmp(parv[0], "EXEC"))
+        {
+            command_fail(si, fault_badparams, STR_INVALID_PARAMS, "GEOIP SCAN");
+            command_fail(si, fault_badparams, _("Syntax: GEOIP SCAN [EXEC]"));
+            return;
+        }
+        execute = true;
+    }
+
+    logcommand(si, CMDLOG_ADMIN, "GEOIP:SCAN:%s", execute ? "EXEC" : "TEST");
+    command_success_nodata(si, "Scanning users against GeoIP rules (%s Mode)...",
+        execute ? "\2EXEC - BANNING\2" : "\2DRY RUN - REPORT ONLY\2");
 
     /* Collect first, act second: we must not K-Line while iterating the user list. */
     MOWGLI_PATRICIA_FOREACH(u, &state, userlist)
@@ -573,8 +774,8 @@ cmd_geoip_scan(struct sourceinfo *si, int parc, char *parv[])
         if (geoip_user_exempt(u)) continue;
         scanned++;
 
-        const char *reason = get_geoip_ban_reason(u);
-        if (reason)
+        long duration;
+        if (get_geoip_ban_reason(u, &duration))
         {
             mowgli_node_add(u, mowgli_node_create(), &victim_list);
         }
@@ -585,19 +786,28 @@ cmd_geoip_scan(struct sourceinfo *si, int parc, char *parv[])
     {
         u = (struct user *)n->data;
 
-        const char *reason = get_geoip_ban_reason(u);
+        long duration;
+        const char *reason = get_geoip_ban_reason(u, &duration);
         if (reason) {
             matched_count++;
-            if (enforce_geoip(u, reason))
-                banned_count++;
+            if (execute) {
+                if (enforce_geoip(u, reason, duration))
+                    banned_count++;
+            } else {
+                command_success_nodata(si, "MATCH: \2%s\2 (%s) -> %s", u->nick, u->ip, reason);
+            }
         }
 
         mowgli_node_delete(n, &victim_list);
         mowgli_node_free(n);
     }
 
-    command_success_nodata(si, "GeoIP Scan complete. Scanned: %d. Matched: %d. New K-Lines: %d.",
-                           scanned, matched_count, banned_count);
+    if (execute)
+        command_success_nodata(si, "GeoIP Scan complete. Scanned: %d. Matched: %d. New K-Lines: %d.",
+                               scanned, matched_count, banned_count);
+    else
+        command_success_nodata(si, "Dry Run complete. Scanned: %d. Found %d matches. (Use \2GEOIP SCAN EXEC\2 to ban)",
+                               scanned, matched_count);
 }
 
 static void
@@ -630,7 +840,9 @@ cmd_geoip_exempt(struct sourceinfo *si, int parc, char *parv[])
             return;
         }
 
-        if (is_exempt(mask))
+        /* Compare masks as text: is_exempt() treats its argument as an IP,
+         * which gave wrong answers when the new entry is itself a mask. */
+        if (find_exempt_mask(mask))
         {
             command_fail(si, fault_nochange, "Mask \2%s\2 is already exempted.", mask);
             return;
@@ -695,26 +907,33 @@ cmd_geoip_add(struct sourceinfo *si, int parc, char *parv[])
 {
     char *type = parv[0];
     char *target = parv[1];
-    char *reason = parv[2];
+    char *rest = parv[2];
+    char buf[BUFSIZE];
+    const char *reason;
+    long duration;
+    char dur_buf[64];
 
     if (!is_sra(si->smu)) {
         command_fail(si, fault_noprivs, STR_NOT_AUTHORIZED);
         return;
     }
 
-    if (!type || !target || !reason)
+    if (!type || !target || !rest)
     {
         command_fail(si, fault_needmoreparams, STR_INSUFFICIENT_PARAMS, "GEOIP ADD");
-        command_fail(si, fault_needmoreparams, _("Usage: GEOIP ADD BADCOUNTRY <CC> <Reason>"));
-        command_fail(si, fault_needmoreparams, _("       GEOIP ADD BADASN <ASN> <Reason>"));
+        command_fail(si, fault_needmoreparams, _("Usage: GEOIP ADD BADCOUNTRY <CC> [duration] <Reason>"));
+        command_fail(si, fault_needmoreparams, _("       GEOIP ADD BADASN <ASN> [duration] <Reason>"));
         return;
     }
 
+    if (!split_duration_reason(si, "GEOIP ADD", rest, buf, sizeof(buf), &duration, &reason))
+        return;
+
     if (!strcasecmp(type, "BADCOUNTRY"))
     {
-        if (strlen(target) != 2)
+        if (strlen(target) != 2 || !isalpha((unsigned char)target[0]) || !isalpha((unsigned char)target[1]))
         {
-            command_fail(si, fault_badparams, "Country code must be exactly 2 characters (ISO 3166-1 alpha-2).");
+            command_fail(si, fault_badparams, "Country code must be exactly 2 letters (ISO 3166-1 alpha-2).");
             return;
         }
         if (find_badcountry(target))
@@ -723,29 +942,42 @@ cmd_geoip_add(struct sourceinfo *si, int parc, char *parv[])
             return;
         }
 
-        add_badcountry_entry(target, reason);
+        add_badcountry_entry(target, reason, duration);
         save_geoip_db();
-        command_success_nodata(si, "Country \2%s\2 added to blocklist. Perform a \2GEOIP SCAN\2 to apply immediately.", target);
-        logcommand(si, CMDLOG_ADMIN, "GEOIP:ADD:BADCOUNTRY: \2%s\2 (Reason: %s)", target, reason);
+        format_entry_duration(duration, dur_buf, sizeof(dur_buf));
+
+        struct badcountry *bc = find_badcountry(target);
+        command_success_nodata(si, "Country \2%s\2 added to blocklist (%s). Perform a \2GEOIP SCAN\2 to preview, \2GEOIP SCAN EXEC\2 to apply now.",
+                               bc->iso_code, dur_buf);
+        logcommand(si, CMDLOG_ADMIN, "GEOIP:ADD:BADCOUNTRY: \2%s\2 (%s) (Reason: %s)", bc->iso_code, dur_buf, reason);
     }
     else if (!strcasecmp(type, "BADASN"))
     {
-        unsigned int asn = atoi(target);
-        if (asn == 0)
+        /* Accept "7018" or "AS7018". */
+        const char *num = target;
+        if (!strncasecmp(num, "AS", 2))
+            num += 2;
+
+        char *end;
+        errno = 0;
+        unsigned long asn = strtoul(num, &end, 10);
+        if (!isdigit((unsigned char)*num) || *end || errno || asn == 0 || asn > UINT_MAX)
         {
-            command_fail(si, fault_badparams, "Invalid ASN specified.");
+            command_fail(si, fault_badparams, "Invalid ASN \2%s\2 (use a number such as 7018 or AS7018).", target);
             return;
         }
-        if (find_badasn(asn))
+        if (find_badasn((unsigned int)asn))
         {
-            command_fail(si, fault_nochange, "ASN \2%u\2 is already blocked.", asn);
+            command_fail(si, fault_nochange, "ASN \2%lu\2 is already blocked.", asn);
             return;
         }
 
-        add_badasn_entry(asn, reason);
+        add_badasn_entry((unsigned int)asn, reason, duration);
         save_geoip_db();
-        command_success_nodata(si, "ASN \2%u\2 added to blocklist. Perform a \2GEOIP SCAN\2 to apply immediately.", asn);
-        logcommand(si, CMDLOG_ADMIN, "GEOIP:ADD:BADASN: \2%u\2 (Reason: %s)", asn, reason);
+        format_entry_duration(duration, dur_buf, sizeof(dur_buf));
+        command_success_nodata(si, "ASN \2%lu\2 added to blocklist (%s). Perform a \2GEOIP SCAN\2 to preview, \2GEOIP SCAN EXEC\2 to apply now.",
+                               asn, dur_buf);
+        logcommand(si, CMDLOG_ADMIN, "GEOIP:ADD:BADASN: \2%lu\2 (%s) (Reason: %s)", asn, dur_buf, reason);
     }
     else
     {
@@ -790,11 +1022,15 @@ cmd_geoip_del(struct sourceinfo *si, int parc, char *parv[])
     }
     else if (!strcasecmp(type, "BADASN"))
     {
-        unsigned int asn = atoi(target);
+        /* Accept "7018" or "AS7018", matching ADD. */
+        const char *num = target;
+        if (!strncasecmp(num, "AS", 2))
+            num += 2;
+        unsigned int asn = (unsigned int)strtoul(num, NULL, 10);
         struct badasn *ba = find_badasn(asn);
         if (!ba)
         {
-            command_fail(si, fault_nosuch_target, "ASN \2%u\2 is not blocked.", asn);
+            command_fail(si, fault_nosuch_target, "ASN \2%s\2 is not blocked.", target);
             return;
         }
         mowgli_node_delete(&ba->node, &badasn_list);
@@ -803,6 +1039,10 @@ cmd_geoip_del(struct sourceinfo *si, int parc, char *parv[])
         save_geoip_db();
         command_success_nodata(si, "ASN \2%u\2 removed from blocklist.", asn);
         logcommand(si, CMDLOG_ADMIN, "GEOIP:DEL:BADASN: \2%u\2", asn);
+    }
+    else
+    {
+        command_fail(si, fault_badparams, "Unknown type. Use BADCOUNTRY or BADASN.");
     }
 }
 
@@ -821,7 +1061,9 @@ cmd_geoip_list(struct sourceinfo *si, int parc, char *parv[])
     MOWGLI_ITER_FOREACH(n, badcountry_list.head)
     {
         struct badcountry *bc = n->data;
-        command_success_nodata(si, "%d: \2%s\2 - %s", ++count, bc->iso_code, bc->reason);
+        char dur_buf[64];
+        format_entry_duration(bc->duration, dur_buf, sizeof(dur_buf));
+        command_success_nodata(si, "%d: \2%s\2 (%s) - %s", ++count, bc->iso_code, dur_buf, bc->reason);
     }
 
     count = 0;
@@ -829,7 +1071,9 @@ cmd_geoip_list(struct sourceinfo *si, int parc, char *parv[])
     MOWGLI_ITER_FOREACH(n, badasn_list.head)
     {
         struct badasn *ba = n->data;
-        command_success_nodata(si, "%d: ASN \2%u\2 - %s", ++count, ba->asn, ba->reason);
+        char dur_buf[64];
+        format_entry_duration(ba->duration, dur_buf, sizeof(dur_buf));
+        command_success_nodata(si, "%d: ASN \2%u\2 (%s) - %s", ++count, ba->asn, dur_buf, ba->reason);
     }
     command_success_nodata(si, "End of lists.");
 }
@@ -859,7 +1103,7 @@ static struct command cmd_geoip_add_rec = {
     .access = PRIV_USER_ADMIN,
     .maxparc = 3,
     .cmd = &cmd_geoip_add,
-    .help = { .path = "oservice/geoip_add" }
+    .help = { .path = "oservice/geoip" }
 };
 
 static struct command cmd_geoip_del_rec = {
@@ -868,7 +1112,7 @@ static struct command cmd_geoip_del_rec = {
     .access = PRIV_USER_ADMIN,
     .maxparc = 2,
     .cmd = &cmd_geoip_del,
-    .help = { .path = "oservice/geoip_del" }
+    .help = { .path = "oservice/geoip" }
 };
 
 static struct command cmd_geoip_list_rec = {
@@ -877,7 +1121,7 @@ static struct command cmd_geoip_list_rec = {
     .access = PRIV_USER_ADMIN,
     .maxparc = 0,
     .cmd = &cmd_geoip_list,
-    .help = { .path = "oservice/geoip_list" }
+    .help = { .path = "oservice/geoip" }
 };
 
 static struct command cmd_geoip_exempt_rec = {
@@ -886,16 +1130,16 @@ static struct command cmd_geoip_exempt_rec = {
     .access = PRIV_USER_ADMIN,
     .maxparc = 3,
     .cmd = &cmd_geoip_exempt,
-    .help = { .path = "oservice/geoip_exempt" }
+    .help = { .path = "oservice/geoip" }
 };
 
 static struct command cmd_geoip_scan_rec = {
     .name = "SCAN",
-    .desc = "Scan all online users against GeoIP rules.",
+    .desc = "Scan online users against GeoIP rules (dry run; EXEC to ban).",
     .access = PRIV_USER_ADMIN,
-    .maxparc = 0,
+    .maxparc = 1,
     .cmd = &cmd_geoip_scan,
-    .help = { .path = "oservice/geoip_scan" }
+    .help = { .path = "oservice/geoip" }
 };
 
 static struct command cmd_geoip = {
@@ -926,6 +1170,7 @@ mod_init(struct module *const restrict m)
     add_top_conf("GEOIP", geoip_config_handler);
     add_conf_item("COUNTRY_DB", &geoip_conf_table, conf_country_db);
     add_conf_item("ASN_DB", &geoip_conf_table, conf_asn_db);
+    add_duration_conf_item("DURATION", &geoip_conf_table, 0, &geoip_default_duration, "s", GEOIP_BUILTIN_DURATION);
 
     /* Register Commands to local table */
     command_add(&cmd_geoip_add_rec, geoip_cmds);
@@ -1002,6 +1247,7 @@ mod_deinit(const enum module_unload_intent intent)
     del_top_conf("GEOIP");
     del_conf_item("COUNTRY_DB", &geoip_conf_table);
     del_conf_item("ASN_DB", &geoip_conf_table);
+    del_conf_item("DURATION", &geoip_conf_table);
 
     if (country_db_loaded) MMDB_close(&country_mmdb);
     if (asn_db_loaded) MMDB_close(&asn_mmdb);
