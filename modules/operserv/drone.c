@@ -77,7 +77,27 @@ enum drone_field {
 
 static const char *const drone_field_names[] = { "any", "nick", "ident", "host", "ip" };
 
+/* Next stable rule ID to hand out; persisted in drone.db as "DN <id>". */
+static unsigned int next_drone_id = 1;
+
+/*
+ * Exemptions: users matching one of these are never checked by any rule.
+ * The mask is matched against nick!ident@host and nick!ident@ip when it
+ * contains '!' or '@', else against the host and the IP. CIDR is accepted
+ * (192.0.2.0/24, *!*@2001:db8::/32).
+ */
+struct drone_exempt {
+    char *mask;
+    char *reason;
+    char *setter;
+    time_t set_time;
+    mowgli_node_t node;
+};
+
+static mowgli_list_t drone_exempt_list;
+
 struct drone_entry {
+    unsigned int id;     /* stable rule ID: never reused or renumbered */
     char *mask;          /* as entered, including any field prefix */
     const char *pattern; /* points into mask, after the prefix */
     enum drone_field field;
@@ -269,26 +289,126 @@ free_drone(struct drone_entry *d)
     mowgli_free(d);
 }
 
+/* Add a built rule to the list. id 0 = assign the next free stable ID. */
 static void
-add_drone(const char *mask, const char *reason, const char *setter, time_t t, long duration, unsigned int hits, time_t last_hit)
+insert_drone(struct drone_entry *d, unsigned int id)
 {
-    struct drone_entry *d = build_drone(mask, reason, setter, t, duration, hits, last_hit);
+    if (id == 0)
+        id = next_drone_id;
+    d->id = id;
+    if (id >= next_drone_id)
+        next_drone_id = id + 1;
     mowgli_node_add(d, &d->node, &drone_list);
 }
 
-/* 1-based position of a rule in the list, as shown by DRONE LIST. */
+static void
+add_drone(const char *mask, const char *reason, const char *setter, time_t t, long duration, unsigned int hits, time_t last_hit, unsigned int id)
+{
+    insert_drone(build_drone(mask, reason, setter, t, duration, hits, last_hit), id);
+}
+
+/* A rule's stable ID, as shown by DRONE LIST and used by MOD/DEL. */
 static unsigned int
-drone_rule_id(const struct drone_entry *target)
+drone_rule_id(const struct drone_entry *d)
+{
+    return d->id;
+}
+
+static struct drone_entry *
+find_drone_by_id(unsigned int id)
 {
     mowgli_node_t *n;
-    unsigned int idx = 0;
     MOWGLI_ITER_FOREACH(n, drone_list.head)
     {
-        idx++;
-        if (n->data == target)
-            return idx;
+        struct drone_entry *d = n->data;
+        if (d->id == id)
+            return d;
     }
-    return 0;
+    return NULL;
+}
+
+static void
+add_drone_exempt(const char *mask, const char *reason, const char *setter, time_t t)
+{
+    struct drone_exempt *e = mowgli_alloc(sizeof(struct drone_exempt));
+    e->mask = sstrdup(mask);
+    e->reason = sstrdup(reason);
+    e->setter = sstrdup(setter);
+    e->set_time = t;
+    mowgli_node_add(e, &e->node, &drone_exempt_list);
+}
+
+static void
+free_drone_exempt(struct drone_exempt *e)
+{
+    free(e->mask);
+    free(e->reason);
+    free(e->setter);
+    mowgli_free(e);
+}
+
+static struct drone_exempt *
+find_drone_exempt_mask(const char *mask)
+{
+    mowgli_node_t *n;
+    MOWGLI_ITER_FOREACH(n, drone_exempt_list.head)
+    {
+        struct drone_exempt *e = n->data;
+        if (!strcasecmp(e->mask, mask))
+            return e;
+    }
+    return NULL;
+}
+
+/* Does one exemption mask cover this user? */
+static bool
+exempt_mask_matches(const char *mask, const struct user *u)
+{
+    char full[BUFSIZE];
+
+    if (strchr(mask, '!') || strchr(mask, '@'))
+    {
+        snprintf(full, sizeof(full), "%s!%s@%s", u->nick, u->user, u->host);
+        if (!match(mask, full))
+            return true;
+        if (u->ip)
+        {
+            snprintf(full, sizeof(full), "%s!%s@%s", u->nick, u->user, u->ip);
+            if (!match(mask, full) || (strchr(mask, '/') && !match_cidr(mask, full)))
+                return true;
+        }
+        return false;
+    }
+
+    if (!match(mask, u->host))
+        return true;
+    if (u->ip)
+    {
+        if (!match(mask, u->ip))
+            return true;
+        if (strchr(mask, '/'))
+        {
+            char cmask[BUFSIZE];
+            snprintf(cmask, sizeof(cmask), "*@%s", mask);
+            snprintf(full, sizeof(full), "x@%s", u->ip);
+            if (!match_cidr(cmask, full))
+                return true;
+        }
+    }
+    return false;
+}
+
+static struct drone_exempt *
+find_user_drone_exempt(const struct user *u)
+{
+    mowgli_node_t *n;
+    MOWGLI_ITER_FOREACH(n, drone_exempt_list.head)
+    {
+        struct drone_exempt *e = n->data;
+        if (exempt_mask_matches(e->mask, u))
+            return e;
+    }
+    return NULL;
 }
 
 static struct drone_entry *
@@ -350,12 +470,29 @@ save_drone_db(void)
         return;
     }
 
-    /* Format: D <mask> \t <time> \t <setter> \t <hits> \t <duration> \t <last_hit> \t <reason> */
+    /*
+     * Format:
+     *   DN <next_id>
+     *   DI <id>              (stable ID of the D line that follows)
+     *   D <mask> \t <time> \t <setter> \t <hits> \t <duration> \t <last_hit> \t <reason>
+     *   DE <mask> \t <time> \t <setter> \t <reason>   (exemption)
+     * D lines are unchanged from older versions, which ignore DN/DI/DE lines,
+     * so downgrading keeps every rule (only IDs and exemptions are lost).
+     */
+    fprintf(f, "DN %u\n", next_drone_id);
+
     MOWGLI_ITER_FOREACH(n, drone_list.head)
     {
         struct drone_entry *d = n->data;
+        fprintf(f, "DI %u\n", d->id);
         fprintf(f, "D %s\t%ld\t%s\t%u\t%ld\t%ld\t%s\n",
             d->mask, (long)d->set_time, d->setter, d->hits, d->duration, (long)d->last_hit, d->reason);
+    }
+
+    MOWGLI_ITER_FOREACH(n, drone_exempt_list.head)
+    {
+        struct drone_exempt *e = n->data;
+        fprintf(f, "DE %s\t%ld\t%s\t%s\n", e->mask, (long)e->set_time, e->setter, e->reason);
     }
 
     bool failed = (fflush(f) != 0 || ferror(f) || fsync(fileno(f)) != 0);
@@ -392,6 +529,7 @@ load_drone_db(void)
     FILE *f = fopen(DRONE_DB_FILE, "r");
     char line[BUFSIZE];
     char *type, *p1, *p2, *p3, *p4, *p5, *p6, *p7;
+    unsigned int pending_id = 0;   /* from a preceding DI line */
 
     if (!f) return;
 
@@ -405,7 +543,33 @@ load_drone_db(void)
 
         /* First token is space-separated "D " */
         type = strtok(line, " ");
-        
+
+        if (type && !strcasecmp(type, "DN"))
+        {
+            p1 = strtok(NULL, " ");
+            unsigned long v = p1 ? strtoul(p1, NULL, 10) : 0;
+            if (v > next_drone_id && v < UINT_MAX)
+                next_drone_id = (unsigned int)v;
+            continue;
+        }
+        if (type && !strcasecmp(type, "DI"))
+        {
+            p1 = strtok(NULL, " ");
+            unsigned long v = p1 ? strtoul(p1, NULL, 10) : 0;
+            pending_id = (v > 0 && v < UINT_MAX) ? (unsigned int)v : 0;
+            continue;
+        }
+        if (type && !strcasecmp(type, "DE"))
+        {
+            p1 = strtok(NULL, "\t"); /* Mask */
+            p2 = strtok(NULL, "\t"); /* Time */
+            p3 = strtok(NULL, "\t"); /* Setter */
+            p4 = strtok(NULL, "");    /* Reason */
+            if (p1 && p2 && p3 && p4)
+                add_drone_exempt(p1, p4, p3, (time_t)atol(p2));
+            continue;
+        }
+
         if (type && !strcasecmp(type, "D"))
         {
             /* Rest is Tab or Pipe separated */
@@ -432,9 +596,18 @@ load_drone_db(void)
                     reason_str = p6; 
                 }
 
-                add_drone(p1, reason_str, p3, (time_t)atol(p2), dur, (unsigned int)atoi(p4), lhit);
+                /*
+                 * Rules from older versions have no DI line; they get IDs in
+                 * file order (1, 2, 3, ...), the same numbers DRONE LIST used
+                 * to show. An ID already in use is not reused.
+                 */
+                unsigned int id = pending_id;
+                if (id && find_drone_by_id(id))
+                    id = 0;
+                add_drone(p1, reason_str, p3, (time_t)atol(p2), dur, (unsigned int)atoi(p4), lhit, id);
             }
         }
+        pending_id = 0;
     }
     fclose(f);
     slog(LG_INFO, "DRONE: Database loaded from %s", DRONE_DB_FILE);
@@ -489,11 +662,31 @@ kline_user_if_new(struct user *u, const char *reason, long duration, const char 
     return true;
 }
 
-/* Users that are never checked: services' own clients, logged-in users, opers. */
+/*
+ * Why a user is never checked, or NULL if they are checked:
+ * services' own clients, logged-in users, opers, and DRONE EXEMPT masks.
+ */
+static const char *
+drone_exempt_reason(struct user *u, char *buf, size_t len)
+{
+    if (!u || is_internal_client(u)) return "services client";
+    if (u->myuser != NULL)           return "logged in to services";
+    if (is_ircop(u))                 return "IRC operator";
+
+    struct drone_exempt *e = find_user_drone_exempt(u);
+    if (e)
+    {
+        snprintf(buf, len, "exemption %s (%s)", e->mask, e->reason);
+        return buf;
+    }
+    return NULL;
+}
+
 static bool
 drone_user_exempt(struct user *u)
 {
-    return (!u || is_internal_client(u) || u->myuser != NULL || is_ircop(u));
+    char buf[BUFSIZE];
+    return drone_exempt_reason(u, buf, sizeof(buf)) != NULL;
 }
 
 /* Return the first rule matching this user (honouring field prefixes). */
@@ -874,17 +1067,17 @@ cmd_drone_add(struct sourceinfo *si, int parc, char *parv[])
         return;
     }
 
-    mowgli_node_add(d, &d->node, &drone_list);
+    insert_drone(d, 0);
     save_drone_db();
 
     char dur_buf[64];
     format_duration(duration, dur_buf, sizeof(dur_buf));
 
-    command_success_nodata(si, "Added \2%s\2 to the Drone blacklist (%s, checks %s). Currently matches %u of %u online users.",
-                           target, dur_buf, drone_field_names[field], matched, total);
+    command_success_nodata(si, "Added \2%s\2 to the Drone blacklist as ID \2%u\2 (%s, checks %s). Currently matches %u of %u online users.",
+                           target, d->id, dur_buf, drone_field_names[field], matched, total);
     if (matched)
         command_success_nodata(si, "Use \2DRONE SCAN\2 to preview and \2DRONE SCAN EXEC\2 to ban users already online.");
-    logcommand(si, CMDLOG_ADMIN, "DRONE:ADD%s: \2%s\2 (%s) Reason: %s", force ? ":FORCE" : "", target, dur_buf, reason);
+    logcommand(si, CMDLOG_ADMIN, "DRONE:ADD%s: ID %u \2%s\2 (%s) Reason: %s", force ? ":FORCE" : "", d->id, target, dur_buf, reason);
 }
 
 static void
@@ -893,9 +1086,6 @@ cmd_drone_mod(struct sourceinfo *si, int parc, char *parv[])
     char *target_id = parv[0];
     char *action = parv[1];
     char *value = parv[2];
-    mowgli_node_t *n;
-    int index = 0;
-    int id_to_find = -1;
 
     if (!is_sra(si->smu)) {
         command_fail(si, fault_noprivs, STR_NOT_AUTHORIZED);
@@ -908,64 +1098,54 @@ cmd_drone_mod(struct sourceinfo *si, int parc, char *parv[])
         return;
     }
 
-    if (is_numeric_string(target_id)) {
-        id_to_find = atoi(target_id);
-    } else {
+    if (!is_numeric_string(target_id)) {
         command_fail(si, fault_badparams, "Target must be a numeric ID (check DRONE LIST).");
         return;
     }
 
-    MOWGLI_ITER_FOREACH(n, drone_list.head)
-    {
-        struct drone_entry *d = n->data;
-        index++;
-
-        if (index == id_to_find)
-        {
-            if (!strcasecmp(action, "DURATION") || !strcasecmp(action, "TIME")) {
-                long new_dur;
-                if (!parse_duration(value, &new_dur)) {
-                    command_fail(si, fault_badparams, "Invalid duration \2%s\2 (use e.g. 30, 10m, 1h, 7d, perm).", value);
-                    return;
-                }
-                d->duration = new_dur;
-
-                char dur_buf[64];
-                format_duration(new_dur, dur_buf, sizeof(dur_buf));
-
-                command_success_nodata(si, "Updated ID \2%d\2 duration to: %s", id_to_find, dur_buf);
-                logcommand(si, CMDLOG_ADMIN, "DRONE:MOD:DURATION: ID %d -> %s", id_to_find, dur_buf);
-            }
-            else if (!strcasecmp(action, "REASON")) {
-                if (strchr(value, '\t')) {
-                    command_fail(si, fault_badparams, "Reasons may not contain tab characters.");
-                    return;
-                }
-                free(d->reason);
-                d->reason = sstrdup(value);
-                command_success_nodata(si, "Updated ID \2%d\2 reason to: %s", id_to_find, d->reason);
-                logcommand(si, CMDLOG_ADMIN, "DRONE:MOD:REASON: ID %d -> %s", id_to_find, d->reason);
-            }
-            else {
-                command_fail(si, fault_badparams, "Unknown action. Use DURATION or REASON.");
-                return;
-            }
-            
-            save_drone_db();
-            return;
-        }
+    unsigned int id = (unsigned int)strtoul(target_id, NULL, 10);
+    struct drone_entry *d = find_drone_by_id(id);
+    if (!d) {
+        command_fail(si, fault_nosuch_target, "Drone ID \2%u\2 not found.", id);
+        return;
     }
 
-    command_fail(si, fault_nosuch_target, "Drone ID \2%d\2 not found.", id_to_find);
+    if (!strcasecmp(action, "DURATION") || !strcasecmp(action, "TIME")) {
+        long new_dur;
+        if (!parse_duration(value, &new_dur)) {
+            command_fail(si, fault_badparams, "Invalid duration \2%s\2 (use e.g. 30, 10m, 1h, 7d, perm).", value);
+            return;
+        }
+        d->duration = new_dur;
+
+        char dur_buf[64];
+        format_duration(new_dur, dur_buf, sizeof(dur_buf));
+
+        command_success_nodata(si, "Updated ID \2%u\2 (%s) duration to: %s", id, d->mask, dur_buf);
+        logcommand(si, CMDLOG_ADMIN, "DRONE:MOD:DURATION: ID %u (%s) -> %s", id, d->mask, dur_buf);
+    }
+    else if (!strcasecmp(action, "REASON")) {
+        if (strchr(value, '\t')) {
+            command_fail(si, fault_badparams, "Reasons may not contain tab characters.");
+            return;
+        }
+        free(d->reason);
+        d->reason = sstrdup(value);
+        command_success_nodata(si, "Updated ID \2%u\2 (%s) reason to: %s", id, d->mask, d->reason);
+        logcommand(si, CMDLOG_ADMIN, "DRONE:MOD:REASON: ID %u (%s) -> %s", id, d->mask, d->reason);
+    }
+    else {
+        command_fail(si, fault_badparams, "Unknown action. Use DURATION or REASON.");
+        return;
+    }
+
+    save_drone_db();
 }
 
 static void
 cmd_drone_del(struct sourceinfo *si, int parc, char *parv[])
 {
     char *target = parv[0];
-    mowgli_node_t *n, *tn;
-    int index_to_del = -1;
-    int current_idx = 0;
 
     if (!is_sra(si->smu)) {
         command_fail(si, fault_noprivs, STR_NOT_AUTHORIZED);
@@ -977,28 +1157,25 @@ cmd_drone_del(struct sourceinfo *si, int parc, char *parv[])
         return;
     }
 
-    if (is_numeric_string(target)) index_to_del = atoi(target);
+    /* A number is a stable ID; anything else (or an unknown number) is a mask. */
+    struct drone_entry *d = NULL;
+    if (is_numeric_string(target))
+        d = find_drone_by_id((unsigned int)strtoul(target, NULL, 10));
+    if (!d)
+        d = find_drone_mask(target);
 
-    MOWGLI_ITER_FOREACH_SAFE(n, tn, drone_list.head)
-    {
-        struct drone_entry *d = n->data;
-        current_idx++;
-
-        if (current_idx == index_to_del || !strcasecmp(d->mask, target))
-        {
-            mowgli_node_delete(n, &drone_list);
-
-            command_success_nodata(si, "Removed \2%s\2 (ID: %d).", d->mask, current_idx);
-            logcommand(si, CMDLOG_ADMIN, "DRONE:DEL: \2%s\2 (ID: %d)", d->mask, current_idx);
-
-            free_drone(d);
-
-            save_drone_db(); 
-            return;
-        }
+    if (!d) {
+        command_fail(si, fault_nosuch_target, "Target \2%s\2 not found.", target);
+        return;
     }
-    
-    command_fail(si, fault_nosuch_target, "Target \2%s\2 not found.", target);
+
+    mowgli_node_delete(&d->node, &drone_list);
+
+    command_success_nodata(si, "Removed \2%s\2 (ID: %u).", d->mask, d->id);
+    logcommand(si, CMDLOG_ADMIN, "DRONE:DEL: \2%s\2 (ID: %u)", d->mask, d->id);
+
+    free_drone(d);
+    save_drone_db();
 }
 
 static void
@@ -1023,12 +1200,16 @@ cmd_drone_test(struct sourceinfo *si, int parc, char *parv[])
     {
         struct drone_entry *d = find_matching_drone(u);
 
+        char why_buf[BUFSIZE];
+        const char *why = drone_exempt_reason(u, why_buf, sizeof(why_buf));
+
         if (!d)
-            command_success_nodata(si, "User \2%s\2 (%s@%s, %s) matches no rule.",
-                u->nick, u->user, u->host, u->ip ? u->ip : "no IP");
-        else if (drone_user_exempt(u))
-            command_success_nodata(si, "User \2%s\2 matches rule #%u \2%s\2 but is exempt (logged in or IRC operator).",
-                u->nick, drone_rule_id(d), d->mask);
+            command_success_nodata(si, "User \2%s\2 (%s@%s, %s) matches no rule%s%s.",
+                u->nick, u->user, u->host, u->ip ? u->ip : "no IP",
+                why ? "; also exempt: " : "", why ? why : "");
+        else if (why)
+            command_success_nodata(si, "User \2%s\2 matches rule #%u \2%s\2 but is exempt: %s.",
+                u->nick, drone_rule_id(d), d->mask, why);
         else
             command_success_nodata(si, "User \2%s\2 (%s@%s, %s) matches rule #%u \2%s\2 and would be K-Lined.",
                 u->nick, u->user, u->host, u->ip ? u->ip : "no IP", drone_rule_id(d), d->mask);
@@ -1054,33 +1235,166 @@ cmd_drone_test(struct sourceinfo *si, int parc, char *parv[])
 static void
 cmd_drone_list(struct sourceinfo *si, int parc, char *parv[])
 {
+    const char *pattern = (parc > 0 && parv[0]) ? parv[0] : NULL;
+
     if (!is_sra(si->smu)) {
         command_fail(si, fault_noprivs, STR_NOT_AUTHORIZED);
         return;
     }
 
     mowgli_node_t *n;
-    unsigned int count = 0;
+    unsigned int shown = 0, total = 0;
     char buf[BUFSIZE];
     char ago_buf[64];
     struct tm tm;
 
-    command_success_nodata(si, "Drone Blacklist:");
+    if (pattern)
+        command_success_nodata(si, "Drone Blacklist (matching \2%s\2 in mask, reason or setter):", pattern);
+    else
+        command_success_nodata(si, "Drone Blacklist:");
+
     MOWGLI_ITER_FOREACH(n, drone_list.head)
     {
         struct drone_entry *d = n->data;
+        total++;
+
+        if (pattern && match(pattern, d->mask) && match(pattern, d->reason) && match(pattern, d->setter))
+            continue;
+        shown++;
+
         tm = *localtime(&d->set_time);
         strftime(buf, BUFSIZE, TIME_FORMAT, &tm);
         render_time_ago(d->last_hit, ago_buf, sizeof(ago_buf));
-        
-        char dur_str[32];
-        if (d->duration == 0) strcpy(dur_str, "Perm");
-        else snprintf(dur_str, sizeof(dur_str), "%lds", d->duration);
 
-        command_success_nodata(si, "%d: \2%s\2 (Hits: %u) (Last: %s) (Dur: %s) (Set: %s on %s)", 
-            ++count, d->mask, d->hits, ago_buf, dur_str, d->setter, buf);
+        char dur_str[32];
+        compact_duration(d->duration, dur_str, sizeof(dur_str));
+
+        command_success_nodata(si, "%u: \2%s\2 (Hits: %u) (Last: %s) (Dur: %s) (Set: %s on %s) - %s",
+            d->id, d->mask, d->hits, ago_buf, dur_str, d->setter, buf, d->reason);
     }
-    command_success_nodata(si, "End of list.");
+
+    if (pattern)
+        command_success_nodata(si, "End of list (%u of %u rules shown).", shown, total);
+    else
+        command_success_nodata(si, "End of list (%u rules).", total);
+}
+
+static void
+cmd_drone_exempt(struct sourceinfo *si, int parc, char *parv[])
+{
+    char *action = parv[0];
+    char *mask = parv[1];
+    char *reason = parv[2];
+
+    if (!is_sra(si->smu)) {
+        command_fail(si, fault_noprivs, STR_NOT_AUTHORIZED);
+        return;
+    }
+
+    if (!action)
+    {
+        command_fail(si, fault_needmoreparams, STR_INSUFFICIENT_PARAMS, "DRONE EXEMPT");
+        command_fail(si, fault_needmoreparams, _("Usage: DRONE EXEMPT ADD <mask> <reason>"));
+        command_fail(si, fault_needmoreparams, _("       DRONE EXEMPT DEL <mask|number>"));
+        command_fail(si, fault_needmoreparams, _("       DRONE EXEMPT LIST"));
+        return;
+    }
+
+    if (!strcasecmp(action, "ADD"))
+    {
+        if (!mask || !reason)
+        {
+            command_fail(si, fault_needmoreparams, STR_INSUFFICIENT_PARAMS, "DRONE EXEMPT ADD");
+            command_fail(si, fault_needmoreparams, _("Usage: DRONE EXEMPT ADD <mask> <reason>"));
+            return;
+        }
+        if (strchr(mask, '\t') || strchr(reason, '\t'))
+        {
+            command_fail(si, fault_badparams, "Masks and reasons may not contain tab characters.");
+            return;
+        }
+        /* An exemption like "*" or "*@*" would switch the scanner off. */
+        if (count_literals(mask) < DRONE_MIN_LITERALS)
+        {
+            command_fail(si, fault_badparams, "Exemption \2%s\2 is too broad: it needs at least %d letters or digits.",
+                         mask, DRONE_MIN_LITERALS);
+            return;
+        }
+        if (find_drone_exempt_mask(mask))
+        {
+            command_fail(si, fault_nochange, "Mask \2%s\2 is already exempted.", mask);
+            return;
+        }
+
+        add_drone_exempt(mask, reason, get_storage_oper_name(si), CURRTIME);
+        save_drone_db();
+
+        /* Show how many online users this covers, as a sanity check. */
+        mowgli_patricia_iteration_state_t state;
+        struct user *u;
+        unsigned int covered = 0;
+        MOWGLI_PATRICIA_FOREACH(u, &state, userlist)
+        {
+            if (!is_internal_client(u) && exempt_mask_matches(mask, u))
+                covered++;
+        }
+
+        command_success_nodata(si, "Added \2%s\2 to the Drone exemption list. It currently covers %u online user(s).",
+                               mask, covered);
+        logcommand(si, CMDLOG_ADMIN, "DRONE:EXEMPT:ADD: \2%s\2 (Reason: %s)", mask, reason);
+    }
+    else if (!strcasecmp(action, "DEL"))
+    {
+        if (!mask)
+        {
+            command_fail(si, fault_needmoreparams, STR_INSUFFICIENT_PARAMS, "DRONE EXEMPT DEL");
+            return;
+        }
+
+        struct drone_exempt *e = find_drone_exempt_mask(mask);
+        if (!e && is_numeric_string(mask))
+        {
+            unsigned int want = (unsigned int)strtoul(mask, NULL, 10), idx = 0;
+            mowgli_node_t *n;
+            MOWGLI_ITER_FOREACH(n, drone_exempt_list.head)
+            {
+                if (++idx == want) { e = n->data; break; }
+            }
+        }
+        if (!e)
+        {
+            command_fail(si, fault_nosuch_target, "Exemption \2%s\2 not found.", mask);
+            return;
+        }
+
+        mowgli_node_delete(&e->node, &drone_exempt_list);
+        command_success_nodata(si, "Removed \2%s\2 from the Drone exemption list.", e->mask);
+        logcommand(si, CMDLOG_ADMIN, "DRONE:EXEMPT:DEL: \2%s\2", e->mask);
+        free_drone_exempt(e);
+        save_drone_db();
+    }
+    else if (!strcasecmp(action, "LIST"))
+    {
+        mowgli_node_t *n;
+        unsigned int count = 0;
+        char buf[BUFSIZE];
+        struct tm tm;
+
+        command_success_nodata(si, "Drone Exemption List:");
+        MOWGLI_ITER_FOREACH(n, drone_exempt_list.head)
+        {
+            struct drone_exempt *e = n->data;
+            tm = *localtime(&e->set_time);
+            strftime(buf, BUFSIZE, TIME_FORMAT, &tm);
+            command_success_nodata(si, "%u: \2%s\2 (Set by: %s on %s) - %s", ++count, e->mask, e->setter, buf, e->reason);
+        }
+        command_success_nodata(si, "End of list (%u exemptions).", count);
+    }
+    else
+    {
+        command_fail(si, fault_badparams, STR_INVALID_PARAMS, "DRONE EXEMPT");
+        command_fail(si, fault_badparams, _("Use ADD, DEL or LIST."));
+    }
 }
 
 struct drone_scan_hit {
@@ -1163,7 +1477,7 @@ cmd_drone_dispatch(struct sourceinfo *si, int parc, char *parv[])
 {
     if (parc < 1) {
         command_fail(si, fault_needmoreparams, STR_INSUFFICIENT_PARAMS, "DRONE");
-        command_fail(si, fault_needmoreparams, _("Available: ADD, MOD, DEL, LIST, SCAN, TEST"));
+        command_fail(si, fault_needmoreparams, _("Available: ADD, MOD, DEL, LIST, EXEMPT, SCAN, TEST"));
         return;
     }
     subcommand_dispatch_simple(si->service, si, parc, parv, drone_cmds, "DRONE");
@@ -1186,8 +1500,12 @@ static struct command cmd_drone_del_rec = {
     .maxparc = 1, .cmd = &cmd_drone_del, .help = { .path = "oservice/drone" }
 };
 static struct command cmd_drone_list_rec = {
-    .name = "LIST", .desc = "List drone rules.", .access = PRIV_USER_ADMIN,
-    .maxparc = 0, .cmd = &cmd_drone_list, .help = { .path = "oservice/drone" }
+    .name = "LIST", .desc = "List drone rules (optionally matching a pattern).", .access = PRIV_USER_ADMIN,
+    .maxparc = 1, .cmd = &cmd_drone_list, .help = { .path = "oservice/drone" }
+};
+static struct command cmd_drone_exempt_rec = {
+    .name = "EXEMPT", .desc = "Manage drone exemptions.", .access = PRIV_USER_ADMIN,
+    .maxparc = 3, .cmd = &cmd_drone_exempt, .help = { .path = "oservice/drone" }
 };
 static struct command cmd_drone_scan_rec = {
     .name = "SCAN", .desc = "Scan users (default: Dry Run).", .access = PRIV_USER_ADMIN,
@@ -1217,7 +1535,8 @@ mod_init(struct module *const restrict m)
     command_add(&cmd_drone_del_rec, drone_cmds);
     command_add(&cmd_drone_list_rec, drone_cmds);
     command_add(&cmd_drone_scan_rec, drone_cmds);
-    command_add(&cmd_drone_test_rec, drone_cmds); 
+    command_add(&cmd_drone_test_rec, drone_cmds);
+    command_add(&cmd_drone_exempt_rec, drone_cmds); 
     command_add(&cmd_drone, oserv->commands);
 
     hook_add_hook("user_add", (void (*)(void *))check_user_hook);
@@ -1260,6 +1579,7 @@ mod_deinit(const enum module_unload_intent intent)
     command_delete(&cmd_drone_list_rec, drone_cmds);
     command_delete(&cmd_drone_scan_rec, drone_cmds);
     command_delete(&cmd_drone_test_rec, drone_cmds);
+    command_delete(&cmd_drone_exempt_rec, drone_cmds);
 
     if (oserv) command_delete(&cmd_drone, oserv->commands);
 
@@ -1269,6 +1589,11 @@ mod_deinit(const enum module_unload_intent intent)
     MOWGLI_ITER_FOREACH_SAFE(n, tn, drone_list.head) {
         mowgli_node_delete(n, &drone_list);
         free_drone(n->data);
+    }
+
+    MOWGLI_ITER_FOREACH_SAFE(n, tn, drone_exempt_list.head) {
+        mowgli_node_delete(n, &drone_exempt_list);
+        free_drone_exempt(n->data);
     }
 
     if (alert_timer) {
