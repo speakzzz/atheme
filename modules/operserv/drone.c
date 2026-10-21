@@ -226,14 +226,19 @@ render_time_ago(time_t t, char *buf, size_t len)
 /* Persistence (Tab Delimited for Safety) */
 /* --------------------------------------------------------------------- */
 
+/*
+ * Write to DRONE_DB_FILE.new and rename it over DRONE_DB_FILE, so a crash or
+ * full disk mid-save leaves the previous database intact.
+ */
 static void
 save_drone_db(void)
 {
-    FILE *f = fopen(DRONE_DB_FILE, "w");
+    const char *tmpfile = DRONE_DB_FILE ".new";
+    FILE *f = fopen(tmpfile, "w");
     mowgli_node_t *n;
 
     if (!f) {
-        slog(LG_ERROR, "DRONE: Could not open %s: %s", DRONE_DB_FILE, strerror(errno));
+        slog(LG_ERROR, "DRONE: Could not open %s: %s", tmpfile, strerror(errno));
         return;
     }
 
@@ -241,11 +246,30 @@ save_drone_db(void)
     MOWGLI_ITER_FOREACH(n, drone_list.head)
     {
         struct drone_entry *d = n->data;
-        fprintf(f, "D %s\t%ld\t%s\t%u\t%ld\t%ld\t%s\n", 
+        fprintf(f, "D %s\t%ld\t%s\t%u\t%ld\t%ld\t%s\n",
             d->mask, (long)d->set_time, d->setter, d->hits, d->duration, (long)d->last_hit, d->reason);
     }
 
-    fclose(f);
+    bool failed = (fflush(f) != 0 || ferror(f) || fsync(fileno(f)) != 0);
+    int saved_errno = errno;
+
+    if (fclose(f) != 0 && !failed) {
+        failed = true;
+        saved_errno = errno;
+    }
+
+    if (failed) {
+        slog(LG_ERROR, "DRONE: Error writing %s: %s; keeping old %s",
+             tmpfile, strerror(saved_errno), DRONE_DB_FILE);
+        (void) unlink(tmpfile);
+        return;
+    }
+
+    if (srename(tmpfile, DRONE_DB_FILE) < 0) {
+        slog(LG_ERROR, "DRONE: Could not rename %s to %s: %s",
+             tmpfile, DRONE_DB_FILE, strerror(errno));
+        (void) unlink(tmpfile);
+    }
 }
 
 static void
@@ -312,6 +336,39 @@ load_drone_db(void)
 /* Core Check Logic (Single Pass) */
 /* --------------------------------------------------------------------- */
 
+/*
+ * K-Line a user unless an active K-Line already covers them.
+ *
+ * The user@host is chosen exactly as kline_add_user() does: the IP when
+ * known, else the host (spoofed/hidden users, so we never send a NULL host),
+ * with the ident only when kline_with_ident is set. Skipping already-covered
+ * targets stops a scan, or a fast-reconnecting botnet, from piling up
+ * identical K-Lines. Returns true if a new K-Line was added.
+ */
+static bool
+kline_user_if_new(struct user *u, const char *reason, long duration, const char *setby)
+{
+    bool use_ident = config_options.kline_with_ident &&
+                     (!config_options.kline_verified_ident || *u->user != '~');
+    const char *kuser = use_ident ? u->user : "*";
+    const char *khost = u->ip ? u->ip : u->host;
+    mowgli_node_t *n;
+
+    MOWGLI_ITER_FOREACH(n, klnlist.head)
+    {
+        struct kline *k = n->data;
+
+        if (k->duration && k->expires <= CURRTIME)
+            continue;   /* expired, not yet purged */
+
+        if (!match(k->user, kuser) && !match(k->host, khost))
+            return false;
+    }
+
+    kline_add(kuser, khost, reason, duration, setby);
+    return true;
+}
+
 /* Users that are never checked: services' own clients, logged-in users, opers. */
 static bool
 drone_user_exempt(struct user *u)
@@ -339,11 +396,12 @@ find_matching_drone(struct user *u)
     return NULL;
 }
 
-static void
+/* Returns true if a new K-Line was placed. */
+static bool
 enforce_drone(struct user *u, struct drone_entry *d)
 {
     struct service *oserv = service_find("operserv");
-    if (!oserv || !u || !d) return;
+    if (!oserv || !u || !d) return false;
 
     /* Update Statistics */
     d->hits++;
@@ -352,15 +410,16 @@ enforce_drone(struct user *u, struct drone_entry *d)
     char reason[BUFSIZE];
     snprintf(reason, sizeof(reason), "Blacklisted: %s", d->reason);
 
-    slog(LG_INFO, "DRONE: Klining user %s (%s) -> Matched blacklist: %s",
-         u->nick, u->ip ? u->ip : u->host, d->mask);
+    if (kline_user_if_new(u, reason, d->duration, oserv->nick))
+    {
+        slog(LG_INFO, "DRONE: Klining user %s (%s) -> Matched blacklist: %s",
+             u->nick, u->ip ? u->ip : u->host, d->mask);
+        return true;
+    }
 
-    /*
-     * kline_add_user() bans u->ip when known and falls back to u->host when
-     * the IRCd did not give us an IP (spoofed/hidden users), so we never
-     * send a K-Line with a NULL host. It also honours kline_with_ident.
-     */
-    kline_add_user(u, reason, d->duration, oserv->nick);
+    slog(LG_DEBUG, "DRONE: %s (%s) matched %s but is already covered by a K-Line",
+         u->nick, u->ip ? u->ip : u->host, d->mask);
+    return false;
 }
 
 /*
@@ -734,6 +793,7 @@ cmd_drone_scan(struct sourceinfo *si, int parc, char *parv[])
     mowgli_node_t *n, *tn;
     int scanned = 0;
     int matches = 0;
+    int new_klines = 0;
 
     logcommand(si, CMDLOG_ADMIN, "DRONE:SCAN:%s", execute ? "EXEC" : "TEST");
     command_success_nodata(si, "Scanning users against Drone blacklist (%s Mode)...", 
@@ -764,9 +824,10 @@ cmd_drone_scan(struct sourceinfo *si, int parc, char *parv[])
         u = h->u;
 
         matches++;
-        if (execute)
-            enforce_drone(u, h->d);
-        else
+        if (execute) {
+            if (enforce_drone(u, h->d))
+                new_klines++;
+        } else
             command_success_nodata(si, "MATCH: \2%s\2 (%s@%s) matches rule \2%s\2",
                 u->nick, u->user, u->ip ? u->ip : u->host, h->d->mask);
 
@@ -775,7 +836,8 @@ cmd_drone_scan(struct sourceinfo *si, int parc, char *parv[])
     }
 
     if (execute)
-        command_success_nodata(si, "Scan complete. Scanned: %d. Banned: %d.", scanned, matches);
+        command_success_nodata(si, "Scan complete. Scanned: %d. Matched: %d. New K-Lines: %d.",
+                               scanned, matches, new_klines);
     else
         command_success_nodata(si, "Dry Run complete. Scanned: %d. Found %d matches. (Use \2SCAN EXEC\2 to ban)", scanned, matches);
 }

@@ -148,15 +148,20 @@ find_badasn(unsigned int asn)
 /* Persistence Functions (Flatfile) */
 /* --------------------------------------------------------------------- */
 
+/*
+ * Write to GEOIP_DB_FILE.new and rename it over GEOIP_DB_FILE, so a crash or
+ * full disk mid-save leaves the previous database intact.
+ */
 static void
 save_geoip_db(void)
 {
-    FILE *f = fopen(GEOIP_DB_FILE, "w");
+    const char *tmpfile = GEOIP_DB_FILE ".new";
+    FILE *f = fopen(tmpfile, "w");
     mowgli_node_t *n;
 
     if (!f)
     {
-        slog(LG_ERROR, "GEOIP: Could not open %s for writing: %s", GEOIP_DB_FILE, strerror(errno));
+        slog(LG_ERROR, "GEOIP: Could not open %s for writing: %s", tmpfile, strerror(errno));
         return;
     }
 
@@ -178,7 +183,29 @@ save_geoip_db(void)
         fprintf(f, "E %s %ld %s %s\n", e->mask, (long)e->set_time, e->setter, e->reason);
     }
 
-    fclose(f);
+    bool failed = (fflush(f) != 0 || ferror(f) || fsync(fileno(f)) != 0);
+    int saved_errno = errno;
+
+    if (fclose(f) != 0 && !failed)
+    {
+        failed = true;
+        saved_errno = errno;
+    }
+
+    if (failed)
+    {
+        slog(LG_ERROR, "GEOIP: Error writing %s: %s; keeping old %s",
+             tmpfile, strerror(saved_errno), GEOIP_DB_FILE);
+        (void) unlink(tmpfile);
+        return;
+    }
+
+    if (srename(tmpfile, GEOIP_DB_FILE) < 0)
+    {
+        slog(LG_ERROR, "GEOIP: Could not rename %s to %s: %s",
+             tmpfile, GEOIP_DB_FILE, strerror(errno));
+        (void) unlink(tmpfile);
+    }
 }
 
 static void
@@ -251,6 +278,70 @@ geoip_config_handler(mowgli_config_file_entry_t *ce)
     return subblock_handler(ce, &geoip_conf_table);
 }
 
+#define DEFAULT_COUNTRY_DB "/var/lib/GeoIP/GeoLite2-Country.mmdb"
+#define DEFAULT_ASN_DB     "/var/lib/GeoIP/GeoLite2-ASN.mmdb"
+
+/*
+ * (Re)open one MaxMind database. On success the old handle (if any) is
+ * replaced; on failure a previously loaded database is kept, so a typo in a
+ * rehashed config does not silently switch GeoIP blocking off.
+ */
+static void
+geoip_open_one(const char *what, const char *path, MMDB_s *db, bool *loaded, int fail_level)
+{
+    MMDB_s fresh;
+    int status = MMDB_open(path, MMDB_MODE_MMAP, &fresh);
+
+    if (status != MMDB_SUCCESS)
+    {
+        if (*loaded)
+            slog(LG_ERROR, "GEOIP: Could not open %s DB %s (%s); keeping the previously loaded one",
+                 what, path, MMDB_strerror(status));
+        else
+            slog(fail_level, "GEOIP: Could not open %s DB %s (%s); %s blocking disabled",
+                 what, path, MMDB_strerror(status), what);
+        return;
+    }
+
+    if (*loaded)
+        MMDB_close(db);
+
+    *db = fresh;
+    *loaded = true;
+    slog(LG_INFO, "GEOIP: %s DB loaded from %s", what, path);
+}
+
+static void
+geoip_open_dbs(void)
+{
+    geoip_open_one("Country", country_db_path ? country_db_path : DEFAULT_COUNTRY_DB,
+                   &country_mmdb, &country_db_loaded, LG_ERROR);
+    geoip_open_one("ASN", asn_db_path ? asn_db_path : DEFAULT_ASN_DB,
+                   &asn_mmdb, &asn_db_loaded, LG_INFO);
+}
+
+/*
+ * Config lifecycle. Atheme runs a module's mod_init as soon as it reads the
+ * loadmodule line, before the geoip { } block is parsed, so the databases
+ * cannot be opened in mod_init. config_purge runs before every (re)parse and
+ * config_ready after it; opening on config_ready means the configured paths
+ * are used, and a REHASH also reopens the files (e.g. after geoipupdate).
+ */
+static void
+geoip_config_purge(void *unused)
+{
+    free(country_db_path);
+    free(asn_db_path);
+    country_db_path = NULL;
+    asn_db_path = NULL;
+}
+
+static void
+geoip_config_ready(void *unused)
+{
+    geoip_open_dbs();
+}
+
 /* --------------------------------------------------------------------- */
 /* Core Check Logic */
 /* --------------------------------------------------------------------- */
@@ -302,7 +393,9 @@ get_geoip_ban_reason(struct user *u)
             {
                 if (entry_data.has_data && (entry_data.type == MMDB_DATA_TYPE_UINT32 || entry_data.type == MMDB_DATA_TYPE_UINT16))
                 {
-                    unsigned int asn = entry_data.uint32;
+                    /* Read the union member that matches the stored type. */
+                    unsigned int asn = (entry_data.type == MMDB_DATA_TYPE_UINT16)
+                                       ? entry_data.uint16 : entry_data.uint32;
                     struct badasn *ba = find_badasn(asn);
                     if (ba)
                     {
@@ -317,38 +410,140 @@ get_geoip_ban_reason(struct user *u)
     return NULL;
 }
 
-static void
+/*
+ * K-Line a user unless an active K-Line already covers them.
+ *
+ * The user@host is chosen exactly as kline_add_user() does (IP when known,
+ * else host; ident only with kline_with_ident). Skipping already-covered
+ * targets stops a scan, or a fast-reconnecting botnet, from piling up
+ * identical K-Lines. Returns true if a new K-Line was added.
+ */
+static bool
+kline_user_if_new(struct user *u, const char *reason, long duration, const char *setby)
+{
+    bool use_ident = config_options.kline_with_ident &&
+                     (!config_options.kline_verified_ident || *u->user != '~');
+    const char *kuser = use_ident ? u->user : "*";
+    const char *khost = u->ip ? u->ip : u->host;
+    mowgli_node_t *n;
+
+    MOWGLI_ITER_FOREACH(n, klnlist.head)
+    {
+        struct kline *k = n->data;
+
+        if (k->duration && k->expires <= CURRTIME)
+            continue;   /* expired, not yet purged */
+
+        if (!match(k->user, kuser) && !match(k->host, khost))
+            return false;
+    }
+
+    kline_add(kuser, khost, reason, duration, setby);
+    return true;
+}
+
+/* Returns true if a new K-Line was placed. */
+static bool
 enforce_geoip(struct user *u, const char *reason)
 {
     struct service *oserv = service_find("operserv");
-    if (!oserv || !u || !reason) return;
+    if (!oserv || !u || !reason) return false;
 
-    slog(LG_INFO, "GEOIP: Klining user %s (%s) -> %s", u->nick, u->ip, reason);
-    
-    /* * We ONLY place the K-Line. 
-     * We do NOT call kill_user().
+    /*
+     * We ONLY place the K-Line, we do NOT call kill_user().
      * The IRCd will see the new K-Line, check the user against it, and perform the kill itself.
      * This avoids race conditions in Atheme and eliminates the assertion warning.
      */
-    kline_add("*", u->ip, reason, 86400, oserv->nick);
+    if (kline_user_if_new(u, reason, 86400, oserv->nick))
+    {
+        slog(LG_INFO, "GEOIP: Klining user %s (%s) -> %s", u->nick, u->ip, reason);
+        return true;
+    }
+
+    slog(LG_DEBUG, "GEOIP: %s (%s) matched (%s) but is already covered by a K-Line",
+         u->nick, u->ip, reason);
+    return false;
+}
+
+/* Users that are never checked: services' own clients, logged-in users, opers. */
+static bool
+geoip_user_exempt(struct user *u)
+{
+    return (!u || is_internal_client(u) || u->myuser != NULL || is_ircop(u));
+}
+
+/*
+ * Deferred checking.
+ *
+ * user_add fires before the protocol module applies the user's umodes and
+ * any burst/SASL login, so u->myuser and is_ircop(u) are always false there.
+ * We queue new users and check them a moment later, once that state is in.
+ */
+struct geoip_pending {
+    char *id;        /* UID if the IRCd uses them, else nick */
+    time_t ts;       /* nick TS, used to detect nick reuse on non-UID IRCds */
+    mowgli_node_t node;
+};
+
+static mowgli_list_t pending_list;
+static mowgli_eventloop_timer_t *pending_timer = NULL;
+
+#define GEOIP_CHECK_DELAY 2 /* seconds */
+
+static void
+geoip_pending_free(struct geoip_pending *p)
+{
+    free(p->id);
+    mowgli_free(p);
+}
+
+static void
+pending_check_func(void *unused)
+{
+    mowgli_node_t *n, *tn;
+
+    /* One-shot timers are released by mowgli after this callback returns. */
+    pending_timer = NULL;
+
+    MOWGLI_ITER_FOREACH_SAFE(n, tn, pending_list.head)
+    {
+        struct geoip_pending *p = n->data;
+        struct user *u = user_find(p->id);
+
+        mowgli_node_delete(n, &pending_list);
+
+        if (u && u->ts == p->ts && !geoip_user_exempt(u))
+        {
+            const char *reason = get_geoip_ban_reason(u);
+            if (reason)
+                enforce_geoip(u, reason);
+        }
+
+        geoip_pending_free(p);
+    }
 }
 
 static void
 check_user_hook(void *data)
 {
-    struct user **u_ptr = (struct user **)data;
+    struct hook_user_nick *hdata = data;
     struct user *u;
 
-    if (!u_ptr) return;
-    u = *u_ptr;
+    if (!hdata) return;
+    u = hdata->u;
 
-    if (!u || is_internal_client(u)) return;
+    if (!u || is_internal_client(u) || !u->ip) return;
+    if (!country_db_loaded && !asn_db_loaded) return;
+    if (!MOWGLI_LIST_LENGTH(&badcountry_list) && !MOWGLI_LIST_LENGTH(&badasn_list)) return;
 
-    const char *reason = get_geoip_ban_reason(u);
-    if (reason)
-    {
-        enforce_geoip(u, reason);
-    }
+    struct geoip_pending *p = mowgli_alloc(sizeof(struct geoip_pending));
+    p->id = sstrdup(u->uid ? u->uid : u->nick);
+    p->ts = u->ts;
+    mowgli_node_add(p, &p->node, &pending_list);
+
+    if (!pending_timer)
+        pending_timer = mowgli_timer_add_once(base_eventloop, "geoip_pending_check",
+                                              pending_check_func, NULL, GEOIP_CHECK_DELAY);
 }
 
 /* --------------------------------------------------------------------- */
@@ -372,9 +567,10 @@ cmd_geoip_scan(struct sourceinfo *si, int parc, char *parv[])
     logcommand(si, CMDLOG_ADMIN, "GEOIP:SCAN");
     command_success_nodata(si, "Scanning all users against GeoIP database...");
 
+    /* Collect first, act second: we must not K-Line while iterating the user list. */
     MOWGLI_PATRICIA_FOREACH(u, &state, userlist)
     {
-        if (is_internal_client(u)) continue;
+        if (geoip_user_exempt(u)) continue;
         scanned++;
 
         const char *reason = get_geoip_ban_reason(u);
@@ -384,23 +580,24 @@ cmd_geoip_scan(struct sourceinfo *si, int parc, char *parv[])
         }
     }
 
-    int banned_count = 0;
+    int matched_count = 0, banned_count = 0;
     MOWGLI_ITER_FOREACH_SAFE(n, tn, victim_list.head)
     {
         u = (struct user *)n->data;
-        if (user_find(u->nick)) 
-        {
-            const char *reason = get_geoip_ban_reason(u); 
-            if (reason) {
-                enforce_geoip(u, reason);
+
+        const char *reason = get_geoip_ban_reason(u);
+        if (reason) {
+            matched_count++;
+            if (enforce_geoip(u, reason))
                 banned_count++;
-            }
         }
+
         mowgli_node_delete(n, &victim_list);
         mowgli_node_free(n);
     }
 
-    command_success_nodata(si, "GeoIP Scan complete. Scanned: %d. Banned: %d.", scanned, banned_count);
+    command_success_nodata(si, "GeoIP Scan complete. Scanned: %d. Matched: %d. New K-Lines: %d.",
+                           scanned, matched_count, banned_count);
 }
 
 static void
@@ -743,31 +940,22 @@ mod_init(struct module *const restrict m)
     /* Hook into user add */
     hook_add_hook("user_add", (void (*)(void *))check_user_hook);
 
-    /* Load Databases */
-    const char *c_path = country_db_path ? country_db_path : "/var/lib/GeoIP/GeoLite2-Country.mmdb";
-    const char *a_path = asn_db_path ? asn_db_path : "/var/lib/GeoIP/GeoLite2-ASN.mmdb";
+    /*
+     * Open the MaxMind databases once the config is fully parsed (and again
+     * on every REHASH), so geoip { country_db; asn_db; } is honoured.
+     */
+    hook_add_config_purge(geoip_config_purge);
+    hook_add_config_ready(geoip_config_ready);
 
-    if (MMDB_open(c_path, MMDB_MODE_MMAP, &country_mmdb) == MMDB_SUCCESS)
-    {
-        slog(LG_INFO, "GeoIP: Country Database loaded from %s", c_path);
-        country_db_loaded = true;
-    }
-    else
-    {
-        slog(LG_ERROR, "GeoIP: Failed to load Country DB from %s", c_path);
-    }
+    /*
+     * Loaded at runtime (MODLOAD) rather than at startup: config_ready will
+     * not fire until the next REHASH, so open the databases now. The
+     * geoip { } block is only read on that REHASH; until then the default
+     * paths are used.
+     */
+    if (!cold_start)
+        geoip_open_dbs();
 
-    /* Soft fail for ASN */
-    if (MMDB_open(a_path, MMDB_MODE_MMAP, &asn_mmdb) == MMDB_SUCCESS)
-    {
-        slog(LG_INFO, "GeoIP: ASN Database loaded from %s", a_path);
-        asn_db_loaded = true;
-    }
-    else
-    {
-        slog(LG_INFO, "GeoIP: Warning: ASN Database not found at %s. ASN blocking disabled.", a_path);
-    }
-    
     /* LOAD DATA FROM FLATFILE */
     load_geoip_db();
 
@@ -780,6 +968,21 @@ mod_deinit(const enum module_unload_intent intent)
     struct service *oserv = service_find("operserv");
 
     hook_del_hook("user_add", (void (*)(void *))check_user_hook);
+    hook_del_config_purge(geoip_config_purge);
+    hook_del_config_ready(geoip_config_ready);
+
+    if (pending_timer)
+    {
+        mowgli_timer_destroy(base_eventloop, pending_timer);
+        pending_timer = NULL;
+    }
+
+    mowgli_node_t *pn, *ptn;
+    MOWGLI_ITER_FOREACH_SAFE(pn, ptn, pending_list.head)
+    {
+        mowgli_node_delete(pn, &pending_list);
+        geoip_pending_free(pn->data);
+    }
 
     /* Delete subcommands from local table */
     command_delete(&cmd_geoip_add_rec, geoip_cmds);
@@ -802,6 +1005,11 @@ mod_deinit(const enum module_unload_intent intent)
 
     if (country_db_loaded) MMDB_close(&country_mmdb);
     if (asn_db_loaded) MMDB_close(&asn_mmdb);
+    country_db_loaded = asn_db_loaded = false;
+
+    free(country_db_path);
+    free(asn_db_path);
+    country_db_path = asn_db_path = NULL;
 
     /* Clean up lists */
     mowgli_node_t *n, *tn;
