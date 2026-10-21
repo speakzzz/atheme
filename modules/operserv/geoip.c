@@ -184,6 +184,22 @@ find_exempt_mask(const char *mask)
     return NULL;
 }
 
+/* Parse "7018" or "AS7018". Returns 0 if invalid. */
+static unsigned int
+parse_asn(const char *target)
+{
+    const char *num = target;
+    if (!strncasecmp(num, "AS", 2))
+        num += 2;
+
+    char *end;
+    errno = 0;
+    unsigned long asn = strtoul(num, &end, 10);
+    if (!isdigit((unsigned char)*num) || *end || errno || asn > UINT_MAX)
+        return 0;
+    return (unsigned int)asn;
+}
+
 /*
  * Strictly parse a duration token, same rules as operserv/drone:
  * "perm", "permanent" or "0" (permanent, 0), or a positive integer with an
@@ -611,7 +627,19 @@ kline_user_if_new(struct user *u, const char *reason, long duration, const char 
                      (!config_options.kline_verified_ident || *u->user != '~');
     const char *kuser = use_ident ? u->user : "*";
     const char *khost = u->ip ? u->ip : u->host;
+    char hostbuf[128];
     mowgli_node_t *n;
+
+    /*
+     * An IPv6 address like "::1" or "::ffff:192.0.2.1" starts with ':',
+     * which IRC would read as the start of the final (trailing) parameter,
+     * breaking the KLINE message. Prefix a 0 ("0::1"), the same address.
+     */
+    if (khost[0] == ':')
+    {
+        snprintf(hostbuf, sizeof(hostbuf), "0%s", khost);
+        khost = hostbuf;
+    }
 
     MOWGLI_ITER_FOREACH(n, klnlist.head)
     {
@@ -628,6 +656,71 @@ kline_user_if_new(struct user *u, const char *reason, long duration, const char 
     return true;
 }
 
+/*
+ * Ban alerts, rate-limited (same scheme as operserv/drone).
+ *
+ * Each new K-Line is logged at LG_INFO, which goes to any logfile target that
+ * includes "info" (e.g. logfile "#services" { ...; info; };). At most
+ * GEOIP_ALERT_MAX lines are sent per GEOIP_ALERT_WINDOW seconds; the rest are
+ * counted and summarised in one line. Every ban is still logged at LG_DEBUG.
+ */
+#define GEOIP_ALERT_WINDOW 10 /* seconds */
+#define GEOIP_ALERT_MAX    5
+
+static time_t alert_window_start = 0;
+static unsigned int alert_sent = 0;
+static unsigned int alert_suppressed = 0;
+static mowgli_eventloop_timer_t *alert_timer = NULL;
+
+static void
+alert_flush(void *unused)
+{
+    alert_timer = NULL;   /* one-shot timers are freed by mowgli after this returns */
+
+    if (alert_suppressed)
+    {
+        slog(LG_INFO, "GEOIP: %u more K-Line(s) in the last %ds not shown individually",
+             alert_suppressed, GEOIP_ALERT_WINDOW);
+        alert_suppressed = 0;
+    }
+}
+
+static void ATHEME_FATTR_PRINTF(1, 2)
+geoip_alert(const char *fmt, ...)
+{
+    char buf[BUFSIZE];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    if (CURRTIME - alert_window_start >= GEOIP_ALERT_WINDOW)
+    {
+        if (alert_timer)
+        {
+            mowgli_timer_destroy(base_eventloop, alert_timer);
+            alert_timer = NULL;
+        }
+        alert_flush(NULL);
+        alert_window_start = CURRTIME;
+        alert_sent = 0;
+    }
+
+    if (alert_sent < GEOIP_ALERT_MAX)
+    {
+        alert_sent++;
+        slog(LG_INFO, "%s", buf);
+        return;
+    }
+
+    slog(LG_DEBUG, "%s", buf);
+    alert_suppressed++;
+    if (!alert_timer)
+        alert_timer = mowgli_timer_add_once(base_eventloop, "geoip_alert_flush", alert_flush, NULL,
+                                            GEOIP_ALERT_WINDOW - (CURRTIME - alert_window_start) + 1);
+}
+
 /* Returns true if a new K-Line was placed. */
 static bool
 enforce_geoip(struct user *u, const char *reason, long duration)
@@ -642,7 +735,10 @@ enforce_geoip(struct user *u, const char *reason, long duration)
      */
     if (kline_user_if_new(u, reason, duration, oserv->nick))
     {
-        slog(LG_INFO, "GEOIP: Klining user %s (%s) -> %s", u->nick, u->ip, reason);
+        char dur[64];
+        format_entry_duration(duration, dur, sizeof(dur));
+        geoip_alert("GEOIP: K-Lined %s!%s@%s (%s) for %s: %s",
+                    u->nick, u->user, u->host, u->ip, dur, reason);
         return true;
     }
 
@@ -954,14 +1050,8 @@ cmd_geoip_add(struct sourceinfo *si, int parc, char *parv[])
     else if (!strcasecmp(type, "BADASN"))
     {
         /* Accept "7018" or "AS7018". */
-        const char *num = target;
-        if (!strncasecmp(num, "AS", 2))
-            num += 2;
-
-        char *end;
-        errno = 0;
-        unsigned long asn = strtoul(num, &end, 10);
-        if (!isdigit((unsigned char)*num) || *end || errno || asn == 0 || asn > UINT_MAX)
+        unsigned long asn = parse_asn(target);
+        if (asn == 0)
         {
             command_fail(si, fault_badparams, "Invalid ASN \2%s\2 (use a number such as 7018 or AS7018).", target);
             return;
@@ -983,6 +1073,110 @@ cmd_geoip_add(struct sourceinfo *si, int parc, char *parv[])
     {
         command_fail(si, fault_badparams, "Unknown type. Use BADCOUNTRY or BADASN.");
     }
+}
+
+static void
+cmd_geoip_mod(struct sourceinfo *si, int parc, char *parv[])
+{
+    char *type = parv[0];
+    char *target = parv[1];
+    char *rest = parv[2];
+
+    if (!is_sra(si->smu)) {
+        command_fail(si, fault_noprivs, STR_NOT_AUTHORIZED);
+        return;
+    }
+
+    if (!type || !target || !rest)
+    {
+        command_fail(si, fault_needmoreparams, STR_INSUFFICIENT_PARAMS, "GEOIP MOD");
+        command_fail(si, fault_needmoreparams, _("Usage: GEOIP MOD BADCOUNTRY|BADASN <target> DURATION <duration|default>"));
+        command_fail(si, fault_needmoreparams, _("       GEOIP MOD BADCOUNTRY|BADASN <target> REASON <reason>"));
+        return;
+    }
+
+    /* rest = "<action> <value...>" */
+    char buf[BUFSIZE];
+    mowgli_strlcpy(buf, rest, sizeof(buf));
+    char *action = buf;
+    char *value = strchr(buf, ' ');
+    if (value)
+    {
+        *value++ = '\0';
+        while (*value == ' ') value++;
+    }
+    if (!value || !*value)
+    {
+        command_fail(si, fault_needmoreparams, STR_INSUFFICIENT_PARAMS, "GEOIP MOD");
+        return;
+    }
+
+    long *dur_field;
+    char **reason_field;
+    char label[32];
+
+    if (!strcasecmp(type, "BADCOUNTRY"))
+    {
+        struct badcountry *bc = find_badcountry(target);
+        if (!bc)
+        {
+            command_fail(si, fault_nosuch_target, "Country \2%s\2 is not blocked.", target);
+            return;
+        }
+        dur_field = &bc->duration;
+        reason_field = &bc->reason;
+        snprintf(label, sizeof(label), "Country %s", bc->iso_code);
+    }
+    else if (!strcasecmp(type, "BADASN"))
+    {
+        unsigned int asn = parse_asn(target);
+        struct badasn *ba = asn ? find_badasn(asn) : NULL;
+        if (!ba)
+        {
+            command_fail(si, fault_nosuch_target, "ASN \2%s\2 is not blocked.", target);
+            return;
+        }
+        dur_field = &ba->duration;
+        reason_field = &ba->reason;
+        snprintf(label, sizeof(label), "ASN %u", ba->asn);
+    }
+    else
+    {
+        command_fail(si, fault_badparams, "Unknown type. Use BADCOUNTRY or BADASN.");
+        return;
+    }
+
+    if (!strcasecmp(action, "DURATION") || !strcasecmp(action, "TIME"))
+    {
+        long d;
+        if (!strcasecmp(value, "default"))
+            d = GEOIP_DURATION_DEFAULT;
+        else if (!parse_duration(value, &d))
+        {
+            command_fail(si, fault_badparams, "Invalid duration \2%s\2 (use e.g. 30, 10m, 1h, 7d, perm, default).", value);
+            return;
+        }
+        *dur_field = d;
+
+        char dur_buf[64];
+        format_entry_duration(d, dur_buf, sizeof(dur_buf));
+        command_success_nodata(si, "%s duration set to %s. Existing K-Lines keep their old length.", label, dur_buf);
+        logcommand(si, CMDLOG_ADMIN, "GEOIP:MOD:DURATION: %s -> %s", label, dur_buf);
+    }
+    else if (!strcasecmp(action, "REASON"))
+    {
+        free(*reason_field);
+        *reason_field = sstrdup(value);
+        command_success_nodata(si, "%s reason set to: %s", label, value);
+        logcommand(si, CMDLOG_ADMIN, "GEOIP:MOD:REASON: %s -> %s", label, value);
+    }
+    else
+    {
+        command_fail(si, fault_badparams, "Unknown action. Use DURATION or REASON.");
+        return;
+    }
+
+    save_geoip_db();
 }
 
 static void
@@ -1023,10 +1217,7 @@ cmd_geoip_del(struct sourceinfo *si, int parc, char *parv[])
     else if (!strcasecmp(type, "BADASN"))
     {
         /* Accept "7018" or "AS7018", matching ADD. */
-        const char *num = target;
-        if (!strncasecmp(num, "AS", 2))
-            num += 2;
-        unsigned int asn = (unsigned int)strtoul(num, NULL, 10);
+        unsigned int asn = parse_asn(target);
         struct badasn *ba = find_badasn(asn);
         if (!ba)
         {
@@ -1085,7 +1276,7 @@ cmd_geoip_dispatch(struct sourceinfo *si, int parc, char *parv[])
     if (parc < 1)
     {
         command_fail(si, fault_needmoreparams, STR_INSUFFICIENT_PARAMS, "GEOIP");
-        command_fail(si, fault_needmoreparams, _("Available commands: ADD, DEL, LIST, EXEMPT, SCAN"));
+        command_fail(si, fault_needmoreparams, _("Available commands: ADD, MOD, DEL, LIST, EXEMPT, SCAN"));
         command_fail(si, fault_needmoreparams, _("Type \2/msg OperServ HELP GEOIP <command>\2 for more information."));
         return;
     }
@@ -1103,6 +1294,15 @@ static struct command cmd_geoip_add_rec = {
     .access = PRIV_USER_ADMIN,
     .maxparc = 3,
     .cmd = &cmd_geoip_add,
+    .help = { .path = "oservice/geoip" }
+};
+
+static struct command cmd_geoip_mod_rec = {
+    .name = "MOD",
+    .desc = "Change the duration or reason of a blocked Country or ASN.",
+    .access = PRIV_USER_ADMIN,
+    .maxparc = 3,
+    .cmd = &cmd_geoip_mod,
     .help = { .path = "oservice/geoip" }
 };
 
@@ -1174,6 +1374,7 @@ mod_init(struct module *const restrict m)
 
     /* Register Commands to local table */
     command_add(&cmd_geoip_add_rec, geoip_cmds);
+    command_add(&cmd_geoip_mod_rec, geoip_cmds);
     command_add(&cmd_geoip_del_rec, geoip_cmds);
     command_add(&cmd_geoip_list_rec, geoip_cmds);
     command_add(&cmd_geoip_exempt_rec, geoip_cmds);
@@ -1222,6 +1423,12 @@ mod_deinit(const enum module_unload_intent intent)
         pending_timer = NULL;
     }
 
+    if (alert_timer)
+    {
+        mowgli_timer_destroy(base_eventloop, alert_timer);
+        alert_timer = NULL;
+    }
+
     mowgli_node_t *pn, *ptn;
     MOWGLI_ITER_FOREACH_SAFE(pn, ptn, pending_list.head)
     {
@@ -1231,6 +1438,7 @@ mod_deinit(const enum module_unload_intent intent)
 
     /* Delete subcommands from local table */
     command_delete(&cmd_geoip_add_rec, geoip_cmds);
+    command_delete(&cmd_geoip_mod_rec, geoip_cmds);
     command_delete(&cmd_geoip_del_rec, geoip_cmds);
     command_delete(&cmd_geoip_list_rec, geoip_cmds);
     command_delete(&cmd_geoip_exempt_rec, geoip_cmds);

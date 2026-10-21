@@ -62,8 +62,25 @@ static mowgli_patricia_t *drone_cmds = NULL;
 static mowgli_list_t drone_list;
 static mowgli_eventloop_timer_t *save_timer = NULL;
 
+/*
+ * Which user field a rule is checked against. A mask may start with
+ * "nick:", "ident:" (or "user:"), "host:" or "ip:" to check only that
+ * field; masks without a prefix check all four, as before.
+ */
+enum drone_field {
+    DRONE_FIELD_ANY = 0,
+    DRONE_FIELD_NICK,
+    DRONE_FIELD_IDENT,
+    DRONE_FIELD_HOST,
+    DRONE_FIELD_IP,
+};
+
+static const char *const drone_field_names[] = { "any", "nick", "ident", "host", "ip" };
+
 struct drone_entry {
-    char *mask;
+    char *mask;          /* as entered, including any field prefix */
+    const char *pattern; /* points into mask, after the prefix */
+    enum drone_field field;
     char *reason;
     char *setter;
     time_t set_time;
@@ -138,23 +155,83 @@ format_duration(long duration, char *buf, size_t len)
         snprintf(buf, len, "%ld sec", duration);
 }
 
+/*
+ * Split an optional "field:" prefix off a mask. Sets *field and returns a
+ * pointer to the pattern that follows. Unknown prefixes are not prefixes
+ * (e.g. an IPv6 mask "2001:db8::*" stays a plain any-field mask).
+ */
+static const char *
+parse_rule_target(const char *mask, enum drone_field *field)
+{
+    static const struct { const char *prefix; enum drone_field field; } prefixes[] = {
+        { "nick:",  DRONE_FIELD_NICK  },
+        { "ident:", DRONE_FIELD_IDENT },
+        { "user:",  DRONE_FIELD_IDENT },
+        { "host:",  DRONE_FIELD_HOST  },
+        { "ip:",    DRONE_FIELD_IP    },
+    };
+
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
+    {
+        size_t len = strlen(prefixes[i].prefix);
+        if (!strncasecmp(mask, prefixes[i].prefix, len))
+        {
+            *field = prefixes[i].field;
+            return mask + len;
+        }
+    }
+
+    *field = DRONE_FIELD_ANY;
+    return mask;
+}
+
+/* Copy the regex body out of "/body/" (the trailing slash is optional). */
+static char *
+regex_body(const char *pattern)
+{
+    char *body = sstrdup(pattern + 1);
+    size_t len = strlen(body);
+    if (len > 0 && body[len - 1] == '/')
+        body[len - 1] = '\0';
+    return body;
+}
+
 static bool
 matches_entry(const struct drone_entry *d, const char *str)
 {
     if (!str) return false;
 
-    if (d->regex) {
+    if (d->regex)
         return (regexec(d->regex, str, 0, NULL, 0) == 0);
-    } else {
-        return (match(d->mask, str) == 0);
+    if (d->pattern[0] == '/')
+        return false;   /* regex that failed to compile: never match */
+    return (match(d->pattern, str) == 0);
+}
+
+/* Does this rule match this user, honouring its field prefix? */
+static bool
+user_matches_drone(const struct drone_entry *d, const struct user *u)
+{
+    switch (d->field)
+    {
+        case DRONE_FIELD_NICK:  return matches_entry(d, u->nick);
+        case DRONE_FIELD_IDENT: return matches_entry(d, u->user);
+        case DRONE_FIELD_HOST:  return matches_entry(d, u->host);
+        case DRONE_FIELD_IP:    return matches_entry(d, u->ip);
+        case DRONE_FIELD_ANY:
+        default:
+            return matches_entry(d, u->nick) || matches_entry(d, u->user) ||
+                   matches_entry(d, u->ip)   || matches_entry(d, u->host);
     }
 }
 
-static void
-add_drone(const char *mask, const char *reason, const char *setter, time_t t, long duration, unsigned int hits, time_t last_hit)
+/* Build a rule without adding it to the list (used for ADD previews too). */
+static struct drone_entry *
+build_drone(const char *mask, const char *reason, const char *setter, time_t t, long duration, unsigned int hits, time_t last_hit)
 {
     struct drone_entry *d = mowgli_alloc(sizeof(struct drone_entry));
     d->mask = sstrdup(mask);
+    d->pattern = parse_rule_target(d->mask, &d->field);
     d->reason = sstrdup(reason);
     d->setter = sstrdup(setter);
     d->set_time = t;
@@ -163,24 +240,55 @@ add_drone(const char *mask, const char *reason, const char *setter, time_t t, lo
     d->last_hit = last_hit;
     d->regex = NULL;
 
-    if (mask[0] == '/')
+    if (d->pattern[0] == '/')
     {
-        char *pattern = sstrdup(mask + 1);
-        size_t len = strlen(pattern);
-        if (len > 0 && pattern[len - 1] == '/') {
-            pattern[len - 1] = '\0';
-        }
+        char *body = regex_body(d->pattern);
 
         d->regex = mowgli_alloc(sizeof(regex_t));
-        if (regcomp(d->regex, pattern, REG_EXTENDED | REG_ICASE | REG_NOSUB) != 0) {
+        if (regcomp(d->regex, body, REG_EXTENDED | REG_ICASE | REG_NOSUB) != 0) {
             slog(LG_ERROR, "DRONE: invalid regex %s in rule list; it will never match", mask);
             mowgli_free(d->regex);
             d->regex = NULL;
         }
-        free(pattern);
+        free(body);
     }
 
+    return d;
+}
+
+static void
+free_drone(struct drone_entry *d)
+{
+    if (d->regex) {
+        regfree(d->regex);
+        mowgli_free(d->regex);
+    }
+    free(d->mask);
+    free(d->reason);
+    free(d->setter);
+    mowgli_free(d);
+}
+
+static void
+add_drone(const char *mask, const char *reason, const char *setter, time_t t, long duration, unsigned int hits, time_t last_hit)
+{
+    struct drone_entry *d = build_drone(mask, reason, setter, t, duration, hits, last_hit);
     mowgli_node_add(d, &d->node, &drone_list);
+}
+
+/* 1-based position of a rule in the list, as shown by DRONE LIST. */
+static unsigned int
+drone_rule_id(const struct drone_entry *target)
+{
+    mowgli_node_t *n;
+    unsigned int idx = 0;
+    MOWGLI_ITER_FOREACH(n, drone_list.head)
+    {
+        idx++;
+        if (n->data == target)
+            return idx;
+    }
+    return 0;
 }
 
 static struct drone_entry *
@@ -352,7 +460,19 @@ kline_user_if_new(struct user *u, const char *reason, long duration, const char 
                      (!config_options.kline_verified_ident || *u->user != '~');
     const char *kuser = use_ident ? u->user : "*";
     const char *khost = u->ip ? u->ip : u->host;
+    char hostbuf[128];
     mowgli_node_t *n;
+
+    /*
+     * An IPv6 address like "::1" or "::ffff:192.0.2.1" starts with ':',
+     * which IRC would read as the start of the final (trailing) parameter,
+     * breaking the KLINE message. Prefix a 0 ("0::1"), the same address.
+     */
+    if (khost[0] == ':')
+    {
+        snprintf(hostbuf, sizeof(hostbuf), "0%s", khost);
+        khost = hostbuf;
+    }
 
     MOWGLI_ITER_FOREACH(n, klnlist.head)
     {
@@ -376,7 +496,7 @@ drone_user_exempt(struct user *u)
     return (!u || is_internal_client(u) || u->myuser != NULL || is_ircop(u));
 }
 
-/* Return the first rule matching this user's nick, ident, IP or host. */
+/* Return the first rule matching this user (honouring field prefixes). */
 static struct drone_entry *
 find_matching_drone(struct user *u)
 {
@@ -386,14 +506,88 @@ find_matching_drone(struct user *u)
     {
         struct drone_entry *d = n->data;
 
-        if (matches_entry(d, u->nick) ||
-            (u->user && matches_entry(d, u->user)) ||
-            (u->ip && matches_entry(d, u->ip)) ||
-            (u->host && matches_entry(d, u->host)))
+        if (user_matches_drone(d, u))
             return d;
     }
 
     return NULL;
+}
+
+/* Short duration for alerts and previews: "Perm", "7d", "2h", "90s". */
+static void
+compact_duration(long duration, char *buf, size_t len)
+{
+    if (duration == 0)          snprintf(buf, len, "Perm");
+    else if (duration % 86400 == 0) snprintf(buf, len, "%ldd", duration / 86400);
+    else if (duration % 3600 == 0)  snprintf(buf, len, "%ldh", duration / 3600);
+    else if (duration % 60 == 0)    snprintf(buf, len, "%ldm", duration / 60);
+    else                            snprintf(buf, len, "%lds", duration);
+}
+
+/*
+ * Ban alerts, rate-limited.
+ *
+ * Each new K-Line is logged at LG_INFO, which goes to any logfile target that
+ * includes "info" (e.g. logfile "#services" { ...; info; };). To keep a botnet
+ * wave from flooding that channel, at most DRONE_ALERT_MAX lines are sent per
+ * DRONE_ALERT_WINDOW seconds; the rest are counted and summarised in one line
+ * when the window ends. Every ban is still logged at LG_DEBUG.
+ */
+#define DRONE_ALERT_WINDOW 10 /* seconds */
+#define DRONE_ALERT_MAX    5
+
+static time_t alert_window_start = 0;
+static unsigned int alert_sent = 0;
+static unsigned int alert_suppressed = 0;
+static mowgli_eventloop_timer_t *alert_timer = NULL;
+
+static void
+alert_flush(void *unused)
+{
+    alert_timer = NULL;   /* one-shot timers are freed by mowgli after this returns */
+
+    if (alert_suppressed)
+    {
+        slog(LG_INFO, "DRONE: %u more K-Line(s) in the last %ds not shown individually (see DRONE LIST hit counts)",
+             alert_suppressed, DRONE_ALERT_WINDOW);
+        alert_suppressed = 0;
+    }
+}
+
+static void ATHEME_FATTR_PRINTF(1, 2)
+drone_alert(const char *fmt, ...)
+{
+    char buf[BUFSIZE];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    if (CURRTIME - alert_window_start >= DRONE_ALERT_WINDOW)
+    {
+        if (alert_timer)
+        {
+            mowgli_timer_destroy(base_eventloop, alert_timer);
+            alert_timer = NULL;
+        }
+        alert_flush(NULL);
+        alert_window_start = CURRTIME;
+        alert_sent = 0;
+    }
+
+    if (alert_sent < DRONE_ALERT_MAX)
+    {
+        alert_sent++;
+        slog(LG_INFO, "%s", buf);
+        return;
+    }
+
+    slog(LG_DEBUG, "%s", buf);
+    alert_suppressed++;
+    if (!alert_timer)
+        alert_timer = mowgli_timer_add_once(base_eventloop, "drone_alert_flush", alert_flush, NULL,
+                                            DRONE_ALERT_WINDOW - (CURRTIME - alert_window_start) + 1);
 }
 
 /* Returns true if a new K-Line was placed. */
@@ -412,8 +606,11 @@ enforce_drone(struct user *u, struct drone_entry *d)
 
     if (kline_user_if_new(u, reason, d->duration, oserv->nick))
     {
-        slog(LG_INFO, "DRONE: Klining user %s (%s) -> Matched blacklist: %s",
-             u->nick, u->ip ? u->ip : u->host, d->mask);
+        char dur[32];
+        compact_duration(d->duration, dur, sizeof(dur));
+        drone_alert("DRONE: K-Lined %s!%s@%s (%s) for %s by rule #%u %s: %s",
+                    u->nick, u->user, u->host, u->ip ? u->ip : "no IP",
+                    dur, drone_rule_id(d), d->mask, d->reason);
         return true;
     }
 
@@ -499,47 +696,121 @@ check_user_hook(void *data)
 /* Commands */
 /* --------------------------------------------------------------------- */
 
+/*
+ * Broad-rule protection.
+ *
+ * A rule is refused (unless FORCE is given) when either
+ *  - its pattern has fewer than DRONE_MIN_LITERALS letters/digits, so it is
+ *    mostly wildcards ("*", "*a*", "/./", "/^[a-z]+$/"), or
+ *  - it would match at least DRONE_BROAD_MIN_USERS currently online users and
+ *    at least DRONE_BROAD_PERCENT of them, or DRONE_BROAD_MAX_USERS users.
+ * Exempt users (logged in, opers, services) are not counted.
+ */
+#define DRONE_MIN_LITERALS     3
+#define DRONE_BROAD_MIN_USERS  5
+#define DRONE_BROAD_PERCENT    10
+#define DRONE_BROAD_MAX_USERS  50
+
+static unsigned int
+count_literals(const char *pattern)
+{
+    unsigned int n = 0;
+    bool escaped = false;
+
+    for (const char *c = pattern; *c; c++)
+    {
+        if (escaped) { escaped = false; continue; }
+        if (*c == '\\') { escaped = true; continue; }
+        if (isalnum((unsigned char)*c)) n++;
+    }
+    return n;
+}
+
+static void
+count_online_matches(const struct drone_entry *d, unsigned int *matched, unsigned int *total,
+                     char *examples, size_t exlen)
+{
+    mowgli_patricia_iteration_state_t state;
+    struct user *u;
+    unsigned int shown = 0;
+
+    *matched = *total = 0;
+    examples[0] = '\0';
+
+    MOWGLI_PATRICIA_FOREACH(u, &state, userlist)
+    {
+        if (drone_user_exempt(u)) continue;
+        (*total)++;
+
+        if (!user_matches_drone(d, u)) continue;
+        (*matched)++;
+
+        if (shown < 5)
+        {
+            if (shown) mowgli_strlcat(examples, ", ", exlen);
+            mowgli_strlcat(examples, u->nick, exlen);
+            shown++;
+        }
+    }
+}
+
 static void
 cmd_drone_add(struct sourceinfo *si, int parc, char *parv[])
 {
-    char *target = parv[0];
-    char *arg2 = parv[1];
-    char *arg3 = parv[2];
-    
-    char reasonbuf[BUFSIZE];
-    const char *reason = NULL;
+    char restbuf[BUFSIZE];
+    const char *target, *rest;
+    const char *reason;
     long duration = DEFAULT_DURATION;
     long parsed;
+    bool force = false;
 
     if (!is_sra(si->smu)) {
         command_fail(si, fault_noprivs, STR_NOT_AUTHORIZED);
         return;
     }
 
-    if (!target || !arg2) {
+    /*
+     * The parent DRONE command splits into at most 4 tokens, so here we get
+     * up to 3: [FORCE] <mask> <rest-of-line>. Put the rest back together and
+     * split "[duration] <reason>" from it ourselves.
+     */
+    if (parv[0] && !strcasecmp(parv[0], "FORCE")) {
+        force = true;
+        target = parv[1];
+        rest = parv[2];
+    } else {
+        target = parv[0];
+        if (parv[1] && parv[2]) {
+            snprintf(restbuf, sizeof(restbuf), "%s %s", parv[1], parv[2]);
+            rest = restbuf;
+        } else {
+            rest = parv[1];
+        }
+    }
+
+    if (!target || !rest) {
         command_fail(si, fault_needmoreparams, STR_INSUFFICIENT_PARAMS, "DRONE ADD");
-        command_fail(si, fault_needmoreparams, _("Usage: DRONE ADD <Mask> [Duration] <Reason>"));
+        command_fail(si, fault_needmoreparams, _("Usage: DRONE ADD [FORCE] <mask> [duration] <reason>"));
         return;
     }
 
-    /*
-     * The parent DRONE command splits into at most 4 tokens, so here we get
-     * <mask> <word> <rest-of-line>. <word> is either a duration or the first
-     * word of the reason.
-     */
-    if (parse_duration(arg2, &parsed)) {
-        if (!arg3) {
+    char first[BUFSIZE];
+    mowgli_strlcpy(first, rest, sizeof(first));
+    char *sp = strchr(first, ' ');
+    if (sp) *sp = '\0';
+
+    if (parse_duration(first, &parsed)) {
+        const char *r = strchr(rest, ' ');
+        while (r && *r == ' ') r++;
+        if (!r || !*r) {
             command_fail(si, fault_needmoreparams, STR_INSUFFICIENT_PARAMS, "DRONE ADD");
             command_fail(si, fault_needmoreparams, _("If you specify a duration, you must provide a reason."));
             return;
         }
         duration = parsed;
-        reason = arg3;
-    } else if (arg3) {
-        snprintf(reasonbuf, sizeof(reasonbuf), "%s %s", arg2, arg3);
-        reason = reasonbuf;
+        reason = r;
     } else {
-        reason = arg2;
+        reason = rest;
     }
 
     if (strchr(target, '\t') || strchr(reason, '\t')) {
@@ -552,16 +823,22 @@ cmd_drone_add(struct sourceinfo *si, int parc, char *parv[])
         return;
     }
 
+    enum drone_field field;
+    const char *pattern = parse_rule_target(target, &field);
+
+    if (!*pattern || !strcmp(pattern, "/") || !strcmp(pattern, "//")) {
+        command_fail(si, fault_badparams, "Empty pattern in \2%s\2.", target);
+        return;
+    }
+
     /* PRE-VALIDATION */
-    if (target[0] == '/')
+    if (pattern[0] == '/')
     {
-        char *pattern = sstrdup(target + 1);
-        size_t len = strlen(pattern);
-        if (len > 0 && pattern[len - 1] == '/') pattern[len - 1] = '\0';
+        char *body = regex_body(pattern);
 
         regex_t reg_check;
-        int err = regcomp(&reg_check, pattern, REG_EXTENDED | REG_ICASE | REG_NOSUB);
-        free(pattern);
+        int err = regcomp(&reg_check, body, REG_EXTENDED | REG_ICASE | REG_NOSUB);
+        free(body);
 
         if (err != 0) {
             char errbuf[256];
@@ -572,14 +849,42 @@ cmd_drone_add(struct sourceinfo *si, int parc, char *parv[])
         regfree(&reg_check);
     }
 
-    add_drone(target, reason, get_storage_oper_name(si), CURRTIME, duration, 0, 0);
+    struct drone_entry *d = build_drone(target, reason, get_storage_oper_name(si), CURRTIME, duration, 0, 0);
+
+    /* Broad-rule checks (see above). */
+    unsigned int matched, total;
+    char examples[BUFSIZE];
+    count_online_matches(d, &matched, &total, examples, sizeof(examples));
+
+    bool few_literals = count_literals(pattern) < DRONE_MIN_LITERALS;
+    bool too_many = (matched >= DRONE_BROAD_MAX_USERS) ||
+                    (matched >= DRONE_BROAD_MIN_USERS && matched * 100 >= total * DRONE_BROAD_PERCENT);
+
+    if ((few_literals || too_many) && !force)
+    {
+        if (few_literals)
+            command_fail(si, fault_badparams, "Rule \2%s\2 is too broad: its pattern has fewer than %d letters or digits.",
+                         target, DRONE_MIN_LITERALS);
+        if (too_many)
+            command_fail(si, fault_badparams, "Rule \2%s\2 would match \2%u\2 of %u online users (e.g. %s).",
+                         target, matched, total, examples);
+        command_fail(si, fault_badparams, "Check it with \2DRONE TEST\2, or add it anyway with \2DRONE ADD FORCE %s ...\2",
+                     target);
+        free_drone(d);
+        return;
+    }
+
+    mowgli_node_add(d, &d->node, &drone_list);
     save_drone_db();
-    
+
     char dur_buf[64];
     format_duration(duration, dur_buf, sizeof(dur_buf));
 
-    command_success_nodata(si, "Added \2%s\2 to the Drone blacklist (%s).", target, dur_buf);
-    logcommand(si, CMDLOG_ADMIN, "DRONE:ADD: \2%s\2 (%s) Reason: %s", target, dur_buf, reason);
+    command_success_nodata(si, "Added \2%s\2 to the Drone blacklist (%s, checks %s). Currently matches %u of %u online users.",
+                           target, dur_buf, drone_field_names[field], matched, total);
+    if (matched)
+        command_success_nodata(si, "Use \2DRONE SCAN\2 to preview and \2DRONE SCAN EXEC\2 to ban users already online.");
+    logcommand(si, CMDLOG_ADMIN, "DRONE:ADD%s: \2%s\2 (%s) Reason: %s", force ? ":FORCE" : "", target, dur_buf, reason);
 }
 
 static void
@@ -682,19 +987,12 @@ cmd_drone_del(struct sourceinfo *si, int parc, char *parv[])
         if (current_idx == index_to_del || !strcasecmp(d->mask, target))
         {
             mowgli_node_delete(n, &drone_list);
-            if (d->regex) {
-                regfree(d->regex);
-                mowgli_free(d->regex);
-            }
-            
+
             command_success_nodata(si, "Removed \2%s\2 (ID: %d).", d->mask, current_idx);
             logcommand(si, CMDLOG_ADMIN, "DRONE:DEL: \2%s\2 (ID: %d)", d->mask, current_idx);
 
-            free(d->mask);
-            free(d->reason);
-            free(d->setter);
-            mowgli_free(d);
-            
+            free_drone(d);
+
             save_drone_db(); 
             return;
         }
@@ -719,6 +1017,24 @@ cmd_drone_test(struct sourceinfo *si, int parc, char *parv[])
         return;
     }
 
+    /* If it is the nick of an online user, test that user properly first. */
+    struct user *u = user_find_named(test_str);
+    if (u && !is_internal_client(u))
+    {
+        struct drone_entry *d = find_matching_drone(u);
+
+        if (!d)
+            command_success_nodata(si, "User \2%s\2 (%s@%s, %s) matches no rule.",
+                u->nick, u->user, u->host, u->ip ? u->ip : "no IP");
+        else if (drone_user_exempt(u))
+            command_success_nodata(si, "User \2%s\2 matches rule #%u \2%s\2 but is exempt (logged in or IRC operator).",
+                u->nick, drone_rule_id(d), d->mask);
+        else
+            command_success_nodata(si, "User \2%s\2 (%s@%s, %s) matches rule #%u \2%s\2 and would be K-Lined.",
+                u->nick, u->user, u->host, u->ip ? u->ip : "no IP", drone_rule_id(d), d->mask);
+    }
+
+    /* Then test the plain string against every rule's pattern. */
     unsigned int idx = 0;
     MOWGLI_ITER_FOREACH(n, drone_list.head)
     {
@@ -726,13 +1042,13 @@ cmd_drone_test(struct sourceinfo *si, int parc, char *parv[])
         idx++;
         if (matches_entry(d, test_str))
         {
-            command_success_nodata(si, "MATCH: String \2%s\2 matches rule \2%s\2 (ID: %u, set by %s)",
-                test_str, d->mask, idx, d->setter);
+            command_success_nodata(si, "MATCH: String \2%s\2 matches rule \2%s\2 (ID: %u, checks %s, set by %s)",
+                test_str, d->mask, idx, drone_field_names[d->field], d->setter);
             return;
         }
     }
 
-    command_success_nodata(si, "NO MATCH: String \2%s\2 is clean.", test_str);
+    command_success_nodata(si, "NO MATCH: String \2%s\2 matches no rule pattern.", test_str);
 }
 
 static void
@@ -951,15 +1267,13 @@ mod_deinit(const enum module_unload_intent intent)
 
     mowgli_node_t *n, *tn;
     MOWGLI_ITER_FOREACH_SAFE(n, tn, drone_list.head) {
-        struct drone_entry *d = n->data;
-        if (d->regex) {
-            regfree(d->regex);
-            mowgli_free(d->regex);
-        }
-        free(d->mask);
-        free(d->reason);
-        free(d->setter);
-        mowgli_free(d);
+        mowgli_node_delete(n, &drone_list);
+        free_drone(n->data);
+    }
+
+    if (alert_timer) {
+        mowgli_timer_destroy(base_eventloop, alert_timer);
+        alert_timer = NULL;
     }
 }
 

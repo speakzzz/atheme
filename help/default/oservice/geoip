@@ -17,6 +17,8 @@ network default (24 hours unless changed in the configuration).
 
 Syntax: GEOIP ADD BADCOUNTRY <CC> [duration] <reason>
         GEOIP ADD BADASN <ASN> [duration] <reason>
+        GEOIP MOD BADCOUNTRY|BADASN <target> DURATION <duration|default>
+        GEOIP MOD BADCOUNTRY|BADASN <target> REASON <reason>
         GEOIP DEL BADCOUNTRY <CC>
         GEOIP DEL BADASN <ASN>
         GEOIP LIST
@@ -24,6 +26,13 @@ Syntax: GEOIP ADD BADCOUNTRY <CC> [duration] <reason>
         GEOIP EXEMPT DEL <ip|mask>
         GEOIP EXEMPT LIST
         GEOIP SCAN [EXEC]
+
+GEOIP MOD changes an entry's duration or reason; "default" makes
+it follow the network default again. It only affects new K-Lines.
+
+Each new K-Line is reported to the services log (e.g. a log
+channel that includes "info"); during a flood, at most 5 per
+10 seconds are shown, followed by a count of the rest.
 
 Adding a country or ASN only affects new connections. To check
 users who are already online, run GEOIP SCAN: on its own it only
@@ -33,6 +42,7 @@ Examples:
     /msg &nick& GEOIP ADD BADCOUNTRY XX 7d Abuse from this country
     /msg &nick& GEOIP ADD BADASN AS64500 Abusive hosting provider
     /msg &nick& GEOIP EXEMPT ADD 192.0.2.* Trusted webchat gateway
+    /msg &nick& GEOIP MOD BADCOUNTRY XX DURATION 30d
     /msg &nick& GEOIP SCAN
     /msg &nick& GEOIP SCAN EXEC
     /msg &nick& GEOIP DEL BADCOUNTRY XX
