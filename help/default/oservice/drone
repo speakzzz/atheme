@@ -1,10 +1,73 @@
-Syntax: DRONE ADD <pattern> [reason]
-        DRONE DEL <pattern>
-        DRONE LIST
+Help for DRONE:
 
-Manages the persistent drone scanner. This allows you to add regex
-patterns to detect and ban botnets (drones) automatically.
+Manages the persistent drone scanner. Rules are matched against
+each connecting user's nick, ident, IP and host; a match places a
+K-Line on the user's IP (or host, if the IP is unknown).
+
+Users who are logged in to services, IRC operators, services'
+own clients and users covered by a DRONE EXEMPT mask are never
+matched. New users are checked about two seconds after they
+connect, so SASL and burst logins are seen.
+
+A rule is either a wildcard mask (* and ?) or a POSIX extended
+regular expression wrapped in slashes. Regexes are case-insensitive.
+POSIX regex does not support \d or \w: use [0-9] and [a-z0-9_].
+
+To check only one field, start the rule with nick:, ident: (or
+user:), host: or ip:. Rules without a prefix check all four.
+
+Durations: a number of seconds, or a number followed by one of
+s, m, h, d, w, y (e.g. 10m, 1h, 7d). Use 0 or "perm" for a
+permanent K-Line. The default is 24 hours.
+
+Broad rules are refused: patterns with fewer than 3 letters or
+digits (such as * or *a*), and rules that would match a large
+share of the users online right now. Add FORCE before the mask
+to add such a rule anyway.
+
+Syntax: DRONE ADD [FORCE] <mask|/regex/> [duration] <reason>
+        DRONE MOD <id> DURATION <duration>
+        DRONE MOD <id> REASON <reason>
+        DRONE DEL <id|mask>
+        DRONE LIST [pattern]
+        DRONE EXEMPT ADD <mask> <reason>
+        DRONE EXEMPT DEL <mask|number>
+        DRONE EXEMPT LIST
+        DRONE TEST <nick|string>
+        DRONE SCAN [EXEC]
+
+Every rule has a permanent ID number, shown by DRONE LIST and in
+K-Line alerts. IDs are never reused or renumbered, so deleting a
+rule does not change the IDs of the others.
+
+DRONE LIST with a pattern (wildcards * and ?) only shows rules
+whose mask, reason or setter matches it, e.g. DRONE LIST *bot*.
+
+DRONE EXEMPT masks protect users from every rule. A mask with
+! or @ is matched against nick!ident@host and nick!ident@ip;
+any other mask against the user's host and IP. CIDR ranges
+such as 192.0.2.0/24 work too. Exemptions also apply to
+DRONE SCAN and are left out of the broad-rule check.
+
+DRONE TEST with the nick of an online user shows whether that
+user would be K-Lined (and why, or why they are exempt); with
+any other string it tests the string against every rule.
+
+DRONE SCAN on its own only reports matches; DRONE SCAN EXEC
+K-Lines every matching user currently online.
+
+Each new K-Line is reported to the services log (e.g. a log
+channel that includes "info"); during a flood, at most 5 per
+10 seconds are shown, followed by a count of the rest.
 
 Examples:
-    /msg OperServ DRONE ADD ^MyBot\d+$ Detected Botnet
-    /msg OperServ DRONE LIST
+    /msg &nick& DRONE ADD nick:/^mybot[0-9]+$/ 7d Detected botnet
+    /msg &nick& DRONE ADD host:*.badvpn.example perm Abusive VPN
+    /msg &nick& DRONE ADD ip:192.0.2.* 1h Flood source
+    /msg &nick& DRONE TEST mybot123
+    /msg &nick& DRONE LIST *bot*
+    /msg &nick& DRONE EXEMPT ADD 192.0.2.0/24 Webchat gateway
+    /msg &nick& DRONE EXEMPT ADD *!*@bouncer.example Trusted bouncer
+    /msg &nick& DRONE SCAN
+    /msg &nick& DRONE MOD 1 DURATION 1h
+    /msg &nick& DRONE DEL 1
